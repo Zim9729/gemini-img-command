@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Gemini 批量图片生成面板
 // @namespace    gemini-img-command
-// @version      2.0.0
+// @version      2.0.1
 // @description  gemini.google.com 批量图片生成配置面板：提前选好文件夹 + 填好提示词，点击「执行」自动循环每一张图（每图独立新对话）→ 等待生成 → 按原图文件名下载，直至全部完成。
 // @author       gemini-img-command
 // @match        https://gemini.google.com/*
@@ -19,7 +19,7 @@
 
 /*
  * ────────────────────────────────────────────────────────────────
- *  Gemini 批量图片生成面板 v2.0.0
+ *  Gemini 批量图片生成面板（配置界面模式）
  *
  *  使用方式（配置界面，无聊天命令）：
  *    1. 打开 gemini.google.com，点击右下角 🖼 圆形按钮（或按 Alt+G）打开面板
@@ -36,6 +36,14 @@
 
 (function () {
   'use strict';
+
+  /* ---- 版本标识与加载横幅（F12 控制台过滤 gic 即可确认脚本是否在运行） ---- */
+  const SCRIPT_VERSION = '2.0.1';
+  try {
+    console.log('%c[gic] Gemini 批量图片生成面板 v' + SCRIPT_VERSION + ' 已加载',
+      'color:#8ab4f8;font-weight:bold');
+    console.log('[gic] 若页面右下角未出现 🖼 悬浮按钮，请检查 Tampermonkey 是否已启用本脚本（且版本为 ' + SCRIPT_VERSION + '），然后刷新页面');
+  } catch (e) {}
 
   /* ============================================================
    * 一、配置
@@ -767,7 +775,7 @@
   function ensureLauncher() {
     if (launcherEl && launcherEl.isConnected) return launcherEl;
     launcherEl = document.createElement('div');
-    launcherEl.title = 'Gemini 批量图片生成（Alt+G 打开/关闭面板）';
+    launcherEl.title = 'Gemini 批量图片生成 v' + SCRIPT_VERSION + '（Alt+G 打开/关闭面板）';
     launcherEl.textContent = '🖼';
     launcherEl.style.cssText = [
       'position:fixed', 'right:20px', 'bottom:20px', 'z-index:2147483646',
@@ -796,7 +804,7 @@
     /* ---- 标题栏（可拖动） ---- */
     const head = document.createElement('div');
     head.style.cssText = 'display:flex;align-items:center;gap:8px;padding:9px 12px;background:#2a2b2f;cursor:move;user-select:none;font-weight:600;font-size:13px';
-    head.textContent = '🖼 Gemini 批量图片生成';
+    head.textContent = '🖼 Gemini 批量图片生成 v' + SCRIPT_VERSION;
     const closeBtn = document.createElement('button');
     closeBtn.textContent = '×';
     closeBtn.title = '收起面板';
@@ -1063,8 +1071,8 @@
 
   function runDiag() {
     const lines = [];
-    let ver = '?';
-    try { ver = GM_info.script.version; } catch (e) {}
+    let ver = SCRIPT_VERSION;
+    try { ver = GM_info.script.version || SCRIPT_VERSION; } catch (e) {}
     lines.push('脚本版本：' + ver + (ver === '?' ? '（无法读取，请检查是否用 Tampermonkey 安装）' : ''));
     lines.push('文件夹选择方式：' + (typeof window.showDirectoryPicker === 'function' ? '原生 API ✅' : '上传控件（兜底）'));
     lines.push('userActivation：' + (navigator.userActivation ? '支持' : '不支持（旧浏览器）'));
@@ -1095,6 +1103,7 @@
   document.addEventListener('keydown', (e) => {
     if (e.altKey && !e.ctrlKey && !e.metaKey && !e.shiftKey && (e.key === 'g' || e.key === 'G')) {
       e.preventDefault();
+      try { ensureLauncher(); } catch (err) {}
       togglePanel();
     }
   });
@@ -1106,13 +1115,30 @@
   } catch (e) { /* 菜单注册失败不影响主功能 */ }
 
   async function boot() {
-    if (document.readyState === 'loading') {
-      await new Promise((r) => document.addEventListener('DOMContentLoaded', r, { once: true }));
+    // 等 document.body 可用（不依赖固定延时，body 一出现就显示按钮）
+    const bodyReady = await waitFor(() => document.body, 30000, 300);
+    if (!bodyReady) {
+      console.error('[gic] document.body 30 秒内未就绪，界面未创建');
+      return;
     }
-    await sleep(1500);
     try {
       ensureLauncher();
       ensurePanel();
+      console.log('[gic] 悬浮按钮与面板已创建（右下角 🖼）');
+    } catch (e) {
+      console.error('[gic] 界面创建失败：', e);
+      toast('面板创建失败：' + ((e && e.message) || e), 8000);
+      return;
+    }
+    // 看门狗：界面若被页面移除，自动补回
+    setInterval(() => {
+      try {
+        if (!launcherEl || !launcherEl.isConnected) ensureLauncher();
+      } catch (e) { /* 忽略 */ }
+    }, 4000);
+
+    await sleep(1200);
+    try {
       const m = metaLoad();
       if (m && !m.done) {
         log('↻ 检测到未完成的队列，自动续跑…');
@@ -1127,6 +1153,7 @@
       }
     } catch (e) {
       console.error('[gic] boot:', e);
+      toast('启动出错：' + ((e && e.message) || e), 8000);
     }
   }
 
