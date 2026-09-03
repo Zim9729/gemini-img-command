@@ -22,10 +22,17 @@ $body = [System.Text.RegularExpressions.Regex]::Replace(
 $verMatch = [System.Text.RegularExpressions.Regex]::Match($userJs, '// @version\s+(\S+)')
 $ver = if ($verMatch.Success) { $verMatch.Groups[1].Value } else { '0.0.0' }
 
+# 同步版本号到 gm-shim.js 的 GM_info（避免诊断面板显示版本读取失败）
+$shim = [System.Text.RegularExpressions.Regex]::Replace(
+  $shim, "version: '[^']*'", "version: '$ver'")
+
 # 拼接：GM shim + 脚本正文
 $content = $shim + "`n" + $body
 [System.IO.File]::WriteAllText($contentPath, $content, $utf8)
 Write-Host "content.js generated (v$ver)" -ForegroundColor Green
+
+# 同步版本号到 gm-shim.js 文件本身（保持源文件一致）
+[System.IO.File]::WriteAllText($shimPath, $shim, $utf8)
 
 # 同步版本号到 manifest.json
 $manifest = [System.IO.File]::ReadAllText($manifestPath, $utf8)
