@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Gemini 图片生成命令 (/img)
 // @namespace    gemini-img-command
-// @version      1.0.0
-// @description  在 gemini.google.com 输入 /img 提示词：自动选图上传 → 发送 → 等待生成 → 按原图文件名下载。支持多图排队、自动新开对话、断点续跑、诊断工具。
+// @version      1.1.0
+// @description  在 gemini.google.com 输入 /img 或 /imgf（整文件夹批量）：自动选图上传 → 发送 → 等待生成 → 按原图文件名下载。支持多图排队、每图独立新对话、断点续跑、诊断工具。
 // @author       gemini-img-command
 // @match        https://gemini.google.com/*
 // @run-at       document-start
@@ -29,13 +29,14 @@
  *
  *  命令列表（/imghelp 可查看）：
  *      /img <提示词>    选图并执行（提示词可省略，用默认）
+ *      /imgf <提示词>   选择整个文件夹，自动批量处理其中所有图片
  *      /imgset <提示词> 设置默认提示词
  *      /imgconf         切换「每张图新开对话」
  *      /imgname         切换「严格原名 / 自动纠正扩展名」
  *      /imgclear        停止并清除当前队列
  *      /imgdiag         诊断页面元素（Google 改版后排查用）
  *      /imghelp         显示帮助
- *  其他入口：Alt+G 快捷键 / Tampermonkey 菜单命令
+ *  其他入口：Alt+G（选图）/ Alt+F（选文件夹）/ Tampermonkey 菜单命令
  * ────────────────────────────────────────────────────────────────
  */
 
@@ -713,7 +714,7 @@
   /* ============================================================
    * 九、命令入口
    * ============================================================ */
-  const CMDS = /^\/(img|imgset|imgconf|imgname|imgclear|imgdiag|imghelp)\b\s*([\s\S]*)$/i;
+  const CMDS = /^\/(imgf|img|imgset|imgconf|imgname|imgclear|imgdiag|imghelp)\b\s*([\s\S]*)$/i;
 
   function pickFiles() {
     return new Promise((resolve) => {
@@ -730,6 +731,38 @@
     });
   }
 
+  /* ---- 文件夹选择（递归抓取所有图片，自动忽略非图片文件） ---- */
+  function isImageFile(f) {
+    if (!f || !f.name || f.name.startsWith('.')) return false;
+    const m = f.name.match(/\.([A-Za-z0-9]+)$/);
+    const ext = m ? m[1].toLowerCase() : '';
+    if (['jpg', 'jpeg', 'png', 'webp', 'gif', 'bmp'].indexOf(ext) >= 0) return true;
+    return !!(f.type && f.type.indexOf('image/') === 0);
+  }
+
+  function pickFolder() {
+    return new Promise((resolve) => {
+      const inp = document.createElement('input');
+      inp.type = 'file';
+      inp.multiple = true;
+      inp.accept = 'image/*';
+      try {
+        inp.setAttribute('webkitdirectory', '');
+        inp.setAttribute('directory', '');
+      } catch (e) { /* 忽略 */ }
+      inp.style.cssText = 'position:fixed;left:-9999px;top:0;';
+      (document.body || document.documentElement).appendChild(inp);
+      const finish = (files) => { try { inp.remove(); } catch (e) {} resolve(files); };
+      inp.addEventListener('change', () => {
+        const imgs = [...inp.files].filter(isImageFile)
+          .sort((a, b) => String(a.webkitRelativePath || a.name).localeCompare(String(b.webkitRelativePath || b.name), 'zh-CN'));
+        finish(imgs);
+      }, { once: true });
+      inp.addEventListener('cancel', () => finish([]), { once: true });
+      inp.click();
+    });
+  }
+
   function handleCommand(text) {
     const m = text.match(CMDS);
     if (!m) return false;
@@ -737,14 +770,21 @@
     const arg = m[2].trim();
     (async () => {
       try {
-        if (cmd === 'img') {
+        if (cmd === 'img' || cmd === 'imgf') {
           let prompt = arg || cfg.defaultPrompt;
           if (!prompt || !prompt.trim()) {
             prompt = (window.prompt('请输入提示词（也可先用 /imgset 保存默认提示词）：', '') || '').trim();
             if (!prompt) { toast('已取消'); return; }
           }
-          const files = await pickFiles();
+          const files = (cmd === 'imgf') ? (await pickFolder()) : (await pickFiles());
           if (!files.length) { toast('未选择图片，已取消'); return; }
+          if (cmd === 'imgf') {
+            const rel = files[0].webkitRelativePath || '';
+            const folder = rel.includes('/') ? rel.split('/')[0] : '';
+            log('📂 文件夹：' + (folder || '(未知)') + '，共 ' + files.length + ' 张图片');
+            if (files.length > 80) toast('提示：一次排队 ' + files.length + ' 张，如遇浏览器存储不足可分批处理', 6000);
+          }
+          toast('已加入队列：' + files.length + ' 张图片，开始自动处理…');
           await startRun(files, prompt);
         } else if (cmd === 'imgset') {
           if (arg) {
@@ -781,7 +821,7 @@
     return true;
   }
 
-  async function quickRun() {
+  async function quickRun(useFolder) {
     const q = metaLoad();
     if (q && !q.done) { toast('已有队列在执行中（/imgclear 可停止）'); return; }
     let prompt = (cfg.defaultPrompt || '').trim();
@@ -789,8 +829,15 @@
       prompt = (window.prompt('请输入提示词（可用 /imgset 保存默认提示词）：', '') || '').trim();
       if (!prompt) return;
     }
-    const files = await pickFiles();
-    if (!files.length) return;
+    const files = useFolder ? (await pickFolder()) : (await pickFiles());
+    if (!files.length) { toast('未选择图片，已取消'); return; }
+    if (useFolder) {
+      const rel = files[0].webkitRelativePath || '';
+      const folder = rel.includes('/') ? rel.split('/')[0] : '';
+      log('📂 文件夹：' + (folder || '(未知)') + '，共 ' + files.length + ' 张图片');
+      if (files.length > 80) toast('提示：一次排队 ' + files.length + ' 张，如遇浏览器存储不足可分批处理', 6000);
+    }
+    toast('已加入队列：' + files.length + ' 张图片，开始自动处理…');
     await startRun(files, prompt);
   }
 
@@ -799,6 +846,7 @@
       'Gemini /img 命令 — 使用帮助',
       '',
       '/img <提示词>     选图并执行（提示词可省略，用默认）',
+      '/imgf <提示词>    选择整个文件夹批量处理',
       '/imgset <提示词>  设置默认提示词',
       '/imgconf          切换「每张图新开对话」',
       '/imgname          切换「严格原名 / 纠正扩展名」',
@@ -806,7 +854,7 @@
       '/imgdiag          诊断页面元素（失效排查）',
       '/imghelp          显示本帮助',
       '',
-      '快捷键：Alt+G = 选图执行（用默认提示词）',
+      '快捷键：Alt+G = 选图执行 / Alt+F = 选文件夹（用默认提示词）',
       '流程：自动上传图片 → 发送提示词 → 等待生成 → 按原文件名下载',
       '下载位置：浏览器「下载」文件夹'
     ].join('\n'));
@@ -883,11 +931,12 @@
     }
   }, true);
 
-  // Alt+G 快捷键
+  // Alt+G（选图）/ Alt+F（选文件夹）快捷键
   document.addEventListener('keydown', (e) => {
-    if (e.altKey && !e.ctrlKey && !e.metaKey && !e.shiftKey && (e.key === 'g' || e.key === 'G')) {
-      e.preventDefault();
-      quickRun();
+    if (e.altKey && !e.ctrlKey && !e.metaKey && !e.shiftKey) {
+      const k = e.key.toLowerCase();
+      if (k === 'g') { e.preventDefault(); quickRun(false); }
+      else if (k === 'f') { e.preventDefault(); quickRun(true); }
     }
   });
 
@@ -895,7 +944,8 @@
    * 十一、Tampermonkey 菜单命令
    * ============================================================ */
   try {
-    GM_registerMenuCommand('🖼 选图并执行（默认提示词）', quickRun);
+    GM_registerMenuCommand('🖼 选图并执行（默认提示词）', () => quickRun(false));
+    GM_registerMenuCommand('📁 选整个文件夹批量处理（默认提示词）', () => quickRun(true));
     GM_registerMenuCommand('✏️ 设置默认提示词', () => {
       const p = window.prompt('默认提示词（/img 不带参数时使用）：', cfg.defaultPrompt || '');
       if (p != null && p.trim()) { cfg.defaultPrompt = p.trim(); saveCfg(); toast('已保存默认提示词'); }
@@ -939,7 +989,7 @@
         processQueue();
       } else if (!sessionStorage.getItem('gic-hint')) {
         sessionStorage.setItem('gic-hint', '1');
-        toast('已启用 /img 命令：输入 /img 提示词 后回车开始（Alt+G 也可）', 6000);
+        toast('已启用 /img 命令：/img 提示词 选图，/imgf 提示词 选文件夹（Alt+G / Alt+F）', 6000);
       }
     } catch (e) {
       console.error('[/img] boot:', e);
