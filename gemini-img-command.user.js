@@ -1,8 +1,8 @@
 // ==UserScript==
-// @name         Gemini 图片生成命令 (/img)
+// @name         Gemini 批量图片生成面板
 // @namespace    gemini-img-command
-// @version      1.2.0
-// @description  在 gemini.google.com 输入 /img 或 /imgf（整文件夹批量）：自动选图上传 → 发送 → 等待生成 → 按原图文件名下载。支持多图排队、每图独立新对话、断点续跑、诊断工具。
+// @version      2.0.0
+// @description  gemini.google.com 批量图片生成配置面板：提前选好文件夹 + 填好提示词，点击「执行」自动循环每一张图（每图独立新对话）→ 等待生成 → 按原图文件名下载，直至全部完成。
 // @author       gemini-img-command
 // @match        https://gemini.google.com/*
 // @run-at       document-start
@@ -19,24 +19,18 @@
 
 /*
  * ────────────────────────────────────────────────────────────────
- *  Gemini 图片生成命令
+ *  Gemini 批量图片生成面板 v2.0.0
  *
- *  在 gemini.google.com 的输入框里输入命令并回车，即可触发全自动流程：
- *      /img 把画面改成下雪的冬天
- *  → 弹出文件选择框（可多选）
- *  → 逐张：自动上传图片 → 填入提示词 → 点击发送 → 等待生成完成
- *  → 下载生成图，文件名与上传的原图完全一致
+ *  使用方式（配置界面，无聊天命令）：
+ *    1. 打开 gemini.google.com，点击右下角 🖼 圆形按钮（或按 Alt+G）打开面板
+ *    2. 在面板中点击「选择文件夹」，选中存放待生成图片的文件夹（会被记住）
+ *    3. 在「提示词」输入框填好提示词（自动保存，下次还在）
+ *    4. 点击「▶ 执行」—— 自动循环每一张图，直至全部完成：
+ *         每张图单独新开一个对话 → 自动上传 → 发送提示词 → 等待生成完成
+ *         → 下载生成图，文件名与原图完全一致
  *
- *  命令列表（/imghelp 可查看）：
- *      /img <提示词>    选图并执行（提示词可省略，用默认）
- *      /imgf <提示词>   选择整个文件夹，自动批量处理其中所有图片
- *      /imgset <提示词> 设置默认提示词
- *      /imgconf         切换「每张图新开对话」
- *      /imgname         切换「严格原名 / 自动纠正扩展名」
- *      /imgclear        停止并清除当前队列
- *      /imgdiag         诊断页面元素（Google 改版后排查用）
- *      /imghelp         显示帮助
- *  其他入口：Alt+G（选图）/ Alt+F（选文件夹）/ Tampermonkey 菜单命令
+ *  说明：受浏览器安全限制，无法直接输入本地路径文本，文件夹通过
+ *  系统选择框指定一次即可，脚本会持久化记住（执行时无需再选）。
  * ────────────────────────────────────────────────────────────────
  */
 
@@ -47,7 +41,7 @@
    * 一、配置
    * ============================================================ */
   const DEFAULT_CFG = {
-    defaultPrompt: '',             // 默认提示词（/img 不带参数时使用）
+    defaultPrompt: '',             // 面板中的提示词（自动保存）
     newChatPerImage: true,         // 每张图新开一个对话
     exactName: true,               // 严格使用原文件名（不做扩展名纠正）
     waitTimeoutMs: 300 * 1000,     // 单张图等待生成的超时（5 分钟）
@@ -151,6 +145,11 @@
   const fileGet = (i) => idbOp('file:' + i, 'readonly', (s) => s.get('file:' + i)).catch(() => null);
   const fileDel = (i) => idbOp('file:' + i, 'readwrite', (s) => s.delete('file:' + i)).catch(() => {});
 
+  // 记住上次的文件夹句柄（Chrome/Edge 支持把 FileSystemDirectoryHandle 存入 IndexedDB）
+  const HANDLE_KEY = 'dirHandle';
+  const saveDirHandle = (h) => idbOp(HANDLE_KEY, 'readwrite', (s) => s.put(h, HANDLE_KEY)).catch(() => {});
+  const loadDirHandle = () => idbOp(HANDLE_KEY, 'readonly', (s) => s.get(HANDLE_KEY)).catch(() => null);
+
   /* ---- 多标签页互斥锁（localStorage，心跳保活） ---- */
   const TAB_ID = Math.random().toString(36).slice(2);
 
@@ -163,7 +162,6 @@
   }
   function tryAcquireLock() {
     const lk = lockInfo();
-    // 其他标签页心跳新鲜且不是我们主动导航过来的 → 不抢
     if (lk && lk.tab !== TAB_ID && Date.now() - lk.ts < 15000 && !navRecent()) return false;
     try { localStorage.removeItem('gic-nav'); } catch (e) {}
     heartbeat();
@@ -180,114 +178,7 @@
   }
 
   /* ============================================================
-   * 四、浮动状态面板
-   * ============================================================ */
-  let panelEl = null;
-  const logLines = [];
-
-  function ensurePanel() {
-    if (panelEl && panelEl.isConnected) return panelEl;
-    if (panelEl) panelEl.remove();
-    panelEl = document.createElement('div');
-    panelEl.style.cssText = [
-      'position:fixed', 'right:20px', 'bottom:20px', 'z-index:2147483646',
-      'width:330px', 'max-height:420px', 'display:none', 'flex-direction:column',
-      'background:#1e1f22', 'color:#e3e3e3', 'font:12px/1.6 system-ui,sans-serif',
-      'border:1px solid #3c4043', 'border-radius:10px',
-      'box-shadow:0 6px 24px rgba(0,0,0,.45)', 'overflow:hidden'
-    ].join(';');
-
-    const head = document.createElement('div');
-    head.style.cssText = 'display:flex;align-items:center;gap:8px;padding:8px 10px;background:#2a2b2f;cursor:move;user-select:none;font-weight:600';
-    head.textContent = 'Gemini /img 命令';
-    const closeBtn = document.createElement('button');
-    closeBtn.textContent = '×';
-    closeBtn.title = '隐藏面板（任务仍在后台执行）';
-    closeBtn.style.cssText = 'margin-left:auto;background:none;border:0;color:#9aa0a6;cursor:pointer;font-size:15px;line-height:1';
-    closeBtn.addEventListener('click', (ev) => {
-      ev.stopPropagation();
-      panelEl.style.display = 'none';
-    });
-    head.appendChild(closeBtn);
-
-    const body = document.createElement('div');
-    body.style.cssText = 'padding:8px 10px;overflow:auto';
-    const list = document.createElement('div');
-    list.className = 'gicp-list';
-    const logEl = document.createElement('div');
-    logEl.className = 'gicp-log';
-    logEl.style.cssText = 'margin-top:6px;white-space:pre-wrap;color:#bdc1c6;font-family:Consolas,Menlo,monospace;font-size:11px;max-height:180px;overflow:auto';
-    body.appendChild(list);
-    body.appendChild(logEl);
-
-    panelEl.appendChild(head);
-    panelEl.appendChild(body);
-    (document.body || document.documentElement).appendChild(panelEl);
-
-    // 面板拖动
-    let dragging = false, sx = 0, sy = 0, ox = 0, oy = 0;
-    head.addEventListener('mousedown', (ev) => {
-      dragging = true; sx = ev.clientX; sy = ev.clientY;
-      const r = panelEl.getBoundingClientRect();
-      ox = r.left; oy = r.top;
-      ev.preventDefault();
-    });
-    window.addEventListener('mousemove', (ev) => {
-      if (!dragging) return;
-      panelEl.style.left = Math.max(0, ox + ev.clientX - sx) + 'px';
-      panelEl.style.top = Math.max(0, oy + ev.clientY - sy) + 'px';
-      panelEl.style.right = 'auto';
-      panelEl.style.bottom = 'auto';
-    });
-    window.addEventListener('mouseup', () => { dragging = false; });
-    return panelEl;
-  }
-
-  function panelShow(m) {
-    const p = ensurePanel();
-    p.style.display = 'flex';
-    if (m) renderList(m);
-  }
-
-  function renderList(m) {
-    if (!panelEl || !m) return;
-    const list = panelEl.querySelector('.gicp-list');
-    if (!list) return;
-    const icons = { pending: '⏸', busy: '⏳', ok: '✅', err: '❌' };
-    let html = m.names.map((n, i) => {
-      const st = m.statuses[i] || 'pending';
-      const err = m.errors && m.errors[i];
-      return '<div>【' + (icons[st] || '⏸') + '】' + (i + 1) + '. ' + escapeHtml(n) +
-        (st === 'err' && err ? ' <span style="color:#f28b82">' + escapeHtml(String(err).slice(0, 50)) + '</span>' : '') +
-        '</div>';
-    }).join('');
-    html += '<div style="margin-top:4px;color:#8ab4f8">Prompt：' + escapeHtml(m.prompt || '') + '</div>';
-    list.innerHTML = html;
-  }
-
-  function panelSetState(m, i, status) {
-    if (!m) return;
-    m.statuses[i] = status;
-    renderList(m);
-  }
-
-  function log(msg) {
-    const line = '[' + now() + '] ' + msg;
-    console.log('[/img]', msg);
-    logLines.push(line);
-    if (logLines.length > 300) logLines.splice(0, logLines.length - 300);
-    try {
-      const p = ensurePanel();
-      const el = p.querySelector('.gicp-log');
-      if (el) {
-        el.textContent = logLines.slice(-80).join('\n') + '\n';
-        el.scrollTop = el.scrollHeight;
-      }
-    } catch (e) { /* 忽略 */ }
-  }
-
-  /* ============================================================
-   * 五、页面 DOM 定位（多层选择器 + 兜底）
+   * 四、页面 DOM 定位（多层选择器 + 兜底）
    * ============================================================ */
   function getEditor() {
     return document.querySelector('.ql-editor')                       // Quill 编辑器（Gemini 输入框）
@@ -416,7 +307,7 @@
   }
 
   /* ============================================================
-   * 六、动作：输入、上传、发送、等待
+   * 五、动作：输入、上传、发送、等待
    * ============================================================ */
   async function clearEditor() {
     const ed = getEditor();
@@ -533,7 +424,7 @@
   }
 
   /* ============================================================
-   * 七、下载与命名
+   * 六、下载与命名
    * ============================================================ */
   function splitName(name) {
     const m = String(name).match(/^(.*?)(?:\.([A-Za-z0-9]{1,5}))?$/);
@@ -594,7 +485,7 @@
       if (!cfg.exactName && realExt && realExt !== p.ext) useExt = realExt;
       const filename = p.base + suffix + '.' + useExt;
       if (realExt && realExt !== useExt) {
-        log('  ⚠ 生成图实际为 ' + realExt.toUpperCase() + ' 格式，文件名保留 .' + useExt + '（/imgname 可切换）');
+        log('  ⚠ 生成图实际为 ' + realExt.toUpperCase() + ' 格式，文件名保留 .' + useExt + '（面板选项可切换）');
       }
       saveBlob(blob, filename);
       log('  💾 已下载：' + filename);
@@ -603,14 +494,14 @@
   }
 
   /* ============================================================
-   * 八、队列调度
+   * 七、队列调度（循环每一张图，直至全部完成）
    * ============================================================ */
   let localRunning = false;
 
   async function startRun(files, prompt) {
     const old = metaLoad();
     if (old && !old.done) {
-      toast('已有队列在执行中（/imgclear 可停止）');
+      toast('已有队列在执行中（点「停止」可终止）');
       return;
     }
     const names = files.map((f) => f.name);
@@ -625,7 +516,8 @@
     };
     metaSave(meta);
     for (let i = 0; i < files.length; i++) await fileSet(i, files[i]);
-    log('🚀 新任务：' + names.length + ' 张图片');
+    log('🚀 新任务：' + names.length + ' 张图片，提示词：' + meta.prompt);
+    updatePanelState();
     processQueue();
   }
 
@@ -648,7 +540,8 @@
     let navigating = false;
     const hb = setInterval(heartbeat, 5000);
     try {
-      panelShow(m);
+      panelShow();
+      renderList(m);
       const ready = await waitFor(() => !!getEditor() && !!composerRoot(), 45000, 600);
       if (!ready) { log('⚠ 页面输入框未就绪；刷新页面后会自动续跑'); return; }
 
@@ -703,20 +596,31 @@
       m.done = true;
       metaSave(m);
       log('🎉 队列完成：成功 ' + okN + '，失败 ' + errN);
-      toast('处理完成：成功 ' + okN + '，失败 ' + errN, 5000);
+      toast('全部处理完成：成功 ' + okN + '，失败 ' + errN, 5000);
     } finally {
       clearInterval(hb);
       localRunning = false;
       if (!navigating) releaseLock();
+      updatePanelState();
+    }
+  }
+
+  function stopQueue() {
+    const q = metaLoad();
+    if (q && !q.done) {
+      q.done = true;
+      metaSave(q);
+      releaseLock();
+      renderList(q);
+      toast('已停止队列（已完成的图片不受影响）');
+    } else {
+      toast('当前没有执行中的队列');
     }
   }
 
   /* ============================================================
-   * 九、命令入口
+   * 八、文件夹/图片选择（三层兜底：原生API → input控件 → 页面内按钮）
    * ============================================================ */
-  const CMDS = /^\/(imgf|img|imgset|imgconf|imgname|imgclear|imgdiag|imghelp)\b\s*([\s\S]*)$/i;
-
-  /* ---- 选择图片/文件夹（三层兜底：原生API → input控件 → 页面内按钮） ---- */
   function isImageName(name) {
     if (!name || name.startsWith('.')) return false;
     const m = String(name).match(/\.([A-Za-z0-9]+)$/);
@@ -832,7 +736,7 @@
           const out = [];
           await walkDir(dir, '', out);
           out.sort((a, b) => a.path.localeCompare(b.path, 'zh-CN'));
-          return { files: out.map((o) => o.file), paths: out.map((o) => o.path) };
+          return { files: out.map((o) => o.file), paths: out.map((o) => o.path), handle: dir };
         } catch (e) {
           if (e && e.name === 'AbortError') return null; // 用户取消
           log('⚠ 原生文件夹选择不可用（' + ((e && e.name) || e) + '），改用上传控件');
@@ -851,92 +755,300 @@
     return r;
   }
 
-  async function runFlow(folder, promptArg) {
-    const q = metaLoad();
-    if (q && !q.done) { toast('已有队列在执行中（/imgclear 可停止）'); return; }
-    toast(folder ? '📂 请在弹出的窗口中选择文件夹…' : '🖼 请在弹出的窗口中选择图片…', 4000);
-    // 注意：必须先弹选择框（要在用户手势内），之后再询问提示词
-    const picked = await chooseImages(folder);
-    if (!picked || !picked.files.length) { toast('未选择图片，已取消'); return; }
-    let prompt = (promptArg || cfg.defaultPrompt || '').trim();
-    if (!prompt) {
-      prompt = (window.prompt('请输入提示词（也可先用 /imgset 保存默认提示词）：', '') || '').trim();
-      if (!prompt) { toast('已取消：未输入提示词'); return; }
-    }
-    if (folder) {
-      const folderName = String(picked.paths[0] || '').split('/')[0] || '(未知)';
-      log('📂 文件夹：' + folderName + '，共 ' + picked.files.length + ' 张图片');
-      if (picked.files.length > 80) toast('提示：一次排队 ' + picked.files.length + ' 张，如遇浏览器存储不足可分批处理', 6000);
-    }
-    toast('已加入队列：' + picked.files.length + ' 张图片，开始自动处理…');
-    await startRun(picked.files, prompt);
+  /* ============================================================
+   * 九、配置面板（主界面）
+   * ============================================================ */
+  let panelEl = null, launcherEl = null;
+  let folderLabelEl = null, promptBox = null, runBtn = null, stopBtn = null;
+  let pickedFiles = null;   // 本次已选图片
+  let pickedLabel = '';     // 「文件夹名 · N 张」
+  const logLines = [];
+
+  function ensureLauncher() {
+    if (launcherEl && launcherEl.isConnected) return launcherEl;
+    launcherEl = document.createElement('div');
+    launcherEl.title = 'Gemini 批量图片生成（Alt+G 打开/关闭面板）';
+    launcherEl.textContent = '🖼';
+    launcherEl.style.cssText = [
+      'position:fixed', 'right:20px', 'bottom:20px', 'z-index:2147483646',
+      'width:44px', 'height:44px', 'border-radius:50%', 'cursor:pointer',
+      'background:#1e1f22', 'color:#8ab4f8', 'border:1px solid #3c4043',
+      'display:flex', 'align-items:center', 'justify-content:center',
+      'font-size:20px', 'box-shadow:0 4px 14px rgba(0,0,0,.4)', 'user-select:none'
+    ].join(';');
+    launcherEl.addEventListener('click', togglePanel);
+    (document.body || document.documentElement).appendChild(launcherEl);
+    return launcherEl;
   }
 
-  function handleCommand(text) {
-    const m = text.match(CMDS);
-    if (!m) return false;
-    const cmd = m[1].toLowerCase();
-    const arg = m[2].trim();
-    (async () => {
+  function ensurePanel() {
+    if (panelEl && panelEl.isConnected) return panelEl;
+    if (panelEl) panelEl.remove();
+    panelEl = document.createElement('div');
+    panelEl.style.cssText = [
+      'position:fixed', 'right:20px', 'bottom:76px', 'z-index:2147483646',
+      'width:360px', 'max-height:78vh', 'display:none', 'flex-direction:column',
+      'background:#1e1f22', 'color:#e3e3e3', 'font:12px/1.6 system-ui,sans-serif',
+      'border:1px solid #3c4043', 'border-radius:12px',
+      'box-shadow:0 6px 24px rgba(0,0,0,.45)', 'overflow:hidden'
+    ].join(';');
+
+    /* ---- 标题栏（可拖动） ---- */
+    const head = document.createElement('div');
+    head.style.cssText = 'display:flex;align-items:center;gap:8px;padding:9px 12px;background:#2a2b2f;cursor:move;user-select:none;font-weight:600;font-size:13px';
+    head.textContent = '🖼 Gemini 批量图片生成';
+    const closeBtn = document.createElement('button');
+    closeBtn.textContent = '×';
+    closeBtn.title = '收起面板';
+    closeBtn.style.cssText = 'margin-left:auto;background:none;border:0;color:#9aa0a6;cursor:pointer;font-size:15px;line-height:1';
+    closeBtn.addEventListener('click', (ev) => { ev.stopPropagation(); panelEl.style.display = 'none'; });
+    head.appendChild(closeBtn);
+
+    /* ---- 内容区 ---- */
+    const body = document.createElement('div');
+    body.style.cssText = 'padding:10px 12px;overflow:auto';
+
+    // 文件夹
+    const row1 = document.createElement('div');
+    row1.style.cssText = 'margin-bottom:8px';
+    const folderBtn = document.createElement('button');
+    folderBtn.textContent = '📁 选择文件夹…';
+    folderBtn.style.cssText = 'background:#2a2b2f;color:#e3e3e3;border:1px solid #3c4043;border-radius:8px;padding:7px 12px;cursor:pointer;font-size:12px';
+    folderBtn.addEventListener('click', chooseFolderClick);
+    folderLabelEl = document.createElement('div');
+    folderLabelEl.style.cssText = 'margin-top:5px;color:#9aa0a6;font-size:11px;word-break:break-all';
+    folderLabelEl.textContent = '未选择';
+    row1.appendChild(folderBtn);
+    row1.appendChild(folderLabelEl);
+    body.appendChild(row1);
+
+    // 提示词
+    const row2 = document.createElement('div');
+    row2.style.cssText = 'margin-bottom:8px';
+    const pLabel = document.createElement('div');
+    pLabel.textContent = '提示词（自动保存，对所有图片生效）：';
+    pLabel.style.cssText = 'margin-bottom:4px;color:#bdc1c6';
+    promptBox = document.createElement('textarea');
+    promptBox.rows = 3;
+    promptBox.placeholder = '例如：把画面改成下雪的冬天';
+    promptBox.value = cfg.defaultPrompt || '';
+    promptBox.style.cssText = 'width:100%;box-sizing:border-box;background:#141517;color:#e3e3e3;border:1px solid #3c4043;border-radius:8px;padding:7px 9px;font:12px/1.6 system-ui,sans-serif;resize:vertical';
+    promptBox.addEventListener('input', () => {
+      cfg.defaultPrompt = promptBox.value;
+      saveCfg();
+    });
+    row2.appendChild(pLabel);
+    row2.appendChild(promptBox);
+    body.appendChild(row2);
+
+    // 选项
+    const row3 = document.createElement('div');
+    row3.style.cssText = 'display:flex;gap:14px;margin-bottom:10px;color:#bdc1c6;font-size:11.5px;flex-wrap:wrap';
+    const cb1 = makeCheckbox('每张图新开对话', cfg.newChatPerImage, (v) => { cfg.newChatPerImage = v; saveCfg(); });
+    const cb2 = makeCheckbox('严格原文件名', cfg.exactName, (v) => { cfg.exactName = v; saveCfg(); });
+    row3.appendChild(cb1);
+    row3.appendChild(cb2);
+    body.appendChild(row3);
+
+    // 按钮行
+    const row4 = document.createElement('div');
+    row4.style.cssText = 'display:flex;gap:8px;margin-bottom:10px';
+    runBtn = document.createElement('button');
+    runBtn.textContent = '▶ 执行';
+    runBtn.style.cssText = 'flex:1;background:#8ab4f8;color:#202124;border:0;border-radius:8px;padding:9px 0;font-size:13px;font-weight:700;cursor:pointer';
+    runBtn.addEventListener('click', executeClick);
+    stopBtn = document.createElement('button');
+    stopBtn.textContent = '⏹ 停止';
+    stopBtn.style.cssText = 'background:#3c2f30;color:#f28b82;border:1px solid #5d4037;border-radius:8px;padding:9px 14px;font-size:12px;cursor:pointer';
+    stopBtn.addEventListener('click', stopQueue);
+    const diagBtn = document.createElement('button');
+    diagBtn.textContent = '🔍 诊断';
+    diagBtn.title = '检查页面元素（出问题时把结果反馈给维护者）';
+    diagBtn.style.cssText = 'background:#2a2b2f;color:#9aa0a6;border:1px solid #3c4043;border-radius:8px;padding:9px 10px;font-size:12px;cursor:pointer';
+    diagBtn.addEventListener('click', runDiag);
+    row4.appendChild(runBtn);
+    row4.appendChild(stopBtn);
+    row4.appendChild(diagBtn);
+    body.appendChild(row4);
+
+    // 进度与日志
+    const list = document.createElement('div');
+    list.className = 'gicp-list';
+    list.style.cssText = 'margin-bottom:6px';
+    const logEl = document.createElement('div');
+    logEl.className = 'gicp-log';
+    logEl.style.cssText = 'white-space:pre-wrap;color:#bdc1c6;font-family:Consolas,Menlo,monospace;font-size:11px;max-height:160px;overflow:auto;border-top:1px dashed #3c4043;padding-top:6px';
+    body.appendChild(list);
+    body.appendChild(logEl);
+
+    panelEl.appendChild(head);
+    panelEl.appendChild(body);
+    (document.body || document.documentElement).appendChild(panelEl);
+
+    // 面板拖动
+    let dragging = false, sx = 0, sy = 0, ox = 0, oy = 0;
+    head.addEventListener('mousedown', (ev) => {
+      dragging = true; sx = ev.clientX; sy = ev.clientY;
+      const r = panelEl.getBoundingClientRect();
+      ox = r.left; oy = r.top;
+      ev.preventDefault();
+    });
+    window.addEventListener('mousemove', (ev) => {
+      if (!dragging) return;
+      panelEl.style.left = Math.max(0, ox + ev.clientX - sx) + 'px';
+      panelEl.style.top = Math.max(0, oy + ev.clientY - sy) + 'px';
+      panelEl.style.right = 'auto';
+      panelEl.style.bottom = 'auto';
+    });
+    window.addEventListener('mouseup', () => { dragging = false; });
+
+    return panelEl;
+  }
+
+  function makeCheckbox(text, checked, onChange) {
+    const label = document.createElement('label');
+    label.style.cssText = 'display:flex;align-items:center;gap:5px;cursor:pointer';
+    const cb = document.createElement('input');
+    cb.type = 'checkbox';
+    cb.checked = !!checked;
+    cb.addEventListener('change', () => onChange(cb.checked));
+    const span = document.createElement('span');
+    span.textContent = text;
+    label.appendChild(cb);
+    label.appendChild(span);
+    return label;
+  }
+
+  function panelShow() {
+    const p = ensurePanel();
+    p.style.display = 'flex';
+    updatePanelState();
+  }
+
+  function togglePanel() {
+    const p = ensurePanel();
+    p.style.display = (p.style.display === 'flex') ? 'none' : 'flex';
+    if (p.style.display === 'flex') updatePanelState();
+  }
+
+  /* ---- 面板状态刷新 ---- */
+  async function updatePanelState() {
+    if (!panelEl || !folderLabelEl || !runBtn || !stopBtn) return;
+    const m = metaLoad();
+    const running = !!(m && !m.done);
+    let label = pickedLabel || '';
+    if (!label) {
+      // 显示记住的文件夹（若有）
       try {
-        if (cmd === 'img' || cmd === 'imgf') {
-          await runFlow(cmd === 'imgf', arg);
-        } else if (cmd === 'imgset') {
-          if (arg) {
-            cfg.defaultPrompt = arg;
-            saveCfg();
-            toast('已保存默认提示词');
-          } else {
-            const p = window.prompt('请输入默认提示词：', cfg.defaultPrompt || '');
-            if (p != null && p.trim()) { cfg.defaultPrompt = p.trim(); saveCfg(); toast('已保存默认提示词'); }
+        const h = await loadDirHandle();
+        if (h && h.name) label = '上次文件夹：' + h.name + '（点「执行」时可直接使用，浏览器可能要求重新授权）';
+      } catch (e) {}
+    }
+    folderLabelEl.textContent = label || '未选择（受浏览器安全限制，文件夹需通过选择框指定，指定一次后会被记住）';
+    runBtn.disabled = running;
+    runBtn.style.opacity = running ? '.5' : '1';
+    stopBtn.disabled = !running;
+    stopBtn.style.opacity = running ? '1' : '.5';
+  }
+
+  /* ---- 选择文件夹 ---- */
+  async function chooseFolderClick() {
+    const r = await chooseImages(true);
+    if (r && r.files && r.files.length) {
+      pickedFiles = r.files;
+      const folderName = String(r.paths[0] || '').split('/')[0] || '(未知)';
+      pickedLabel = folderName + ' · ' + r.files.length + ' 张图片';
+      if (r.handle) saveDirHandle(r.handle);
+      log('📂 已选择文件夹：' + folderName + '，共 ' + r.files.length + ' 张图片');
+      if (r.files.length > 80) toast('提示：一次排队 ' + r.files.length + ' 张，如遇浏览器存储不足可分批处理', 6000);
+      updatePanelState();
+    } else {
+      toast('未选择文件夹');
+    }
+  }
+
+  /* ---- 执行 ---- */
+  async function executeClick() {
+    const q = metaLoad();
+    if (q && !q.done) { toast('队列正在执行中'); return; }
+
+    // 本次会话已选过 → 直接用；否则尝试上次的文件夹句柄
+    let files = pickedFiles;
+    if (!files || !files.length) {
+      try {
+        const h = await loadDirHandle();
+        if (h) {
+          let perm = 'denied';
+          try { perm = await h.queryPermission({ mode: 'read' }); } catch (e) {}
+          if (perm !== 'granted' && navigator.userActivation) {
+            try { perm = await h.requestPermission({ mode: 'read' }); } catch (e) {}
           }
-        } else if (cmd === 'imgconf') {
-          cfg.newChatPerImage = !cfg.newChatPerImage;
-          saveCfg();
-          toast('每张图新开对话：' + (cfg.newChatPerImage ? '开' : '关'));
-        } else if (cmd === 'imgname') {
-          cfg.exactName = !cfg.exactName;
-          saveCfg();
-          toast(cfg.exactName ? '命名：严格使用原文件名' : '命名：原名 + 自动纠正扩展名');
-        } else if (cmd === 'imgclear') {
-          const q = metaLoad();
-          if (q && !q.done) { q.done = true; metaSave(q); releaseLock(); toast('已停止并清除队列'); }
-          else toast('当前没有执行中的队列');
-        } else if (cmd === 'imgdiag') {
-          await sleep(100);
-          runDiag();
-        } else if (cmd === 'imghelp') {
-          showHelp();
+          if (perm === 'granted') {
+            const out = [];
+            await walkDir(h, '', out);
+            out.sort((a, b) => a.path.localeCompare(b.path, 'zh-CN'));
+            files = out.map((o) => o.file);
+            if (files.length) {
+              pickedFiles = files;
+              pickedLabel = (h.name || '(未知)') + ' · ' + files.length + ' 张图片';
+              log('📂 使用上次文件夹：' + (h.name || '') + '，共 ' + files.length + ' 张图片');
+            }
+          }
         }
-      } catch (e) {
-        toast('命令出错：' + ((e && e.message) || e));
-        log('命令出错：' + ((e && e.message) || e));
+      } catch (e) { /* 句柄不可用，走选择流程 */ }
+    }
+    if (!files || !files.length) {
+      toast('请先点击「选择文件夹」选择图片所在文件夹');
+      return;
+    }
+
+    const prompt = (promptBox ? promptBox.value : cfg.defaultPrompt || '').trim();
+    if (!prompt) {
+      toast('请先填写提示词');
+      if (promptBox) promptBox.focus();
+      return;
+    }
+    cfg.defaultPrompt = prompt;
+    saveCfg();
+    if (files.length > 80) toast('提示：一次排队 ' + files.length + ' 张，如遇浏览器存储不足可分批处理', 6000);
+    await startRun(files, prompt);
+  }
+
+  /* ---- 进度列表 / 日志 ---- */
+  function renderList(m) {
+    if (!panelEl || !m) return;
+    const list = panelEl.querySelector('.gicp-list');
+    if (!list) return;
+    const icons = { pending: '⏸', busy: '⏳', ok: '✅', err: '❌' };
+    let html = m.names.map((n, i) => {
+      const st = m.statuses[i] || 'pending';
+      const err = m.errors && m.errors[i];
+      return '<div>【' + (icons[st] || '⏸') + '】' + (i + 1) + '. ' + escapeHtml(n) +
+        (st === 'err' && err ? ' <span style="color:#f28b82">' + escapeHtml(String(err).slice(0, 50)) + '</span>' : '') +
+        '</div>';
+    }).join('');
+    list.innerHTML = html;
+  }
+
+  function panelSetState(m, i, status) {
+    if (!m) return;
+    m.statuses[i] = status;
+    renderList(m);
+  }
+
+  function log(msg) {
+    const line = '[' + now() + '] ' + msg;
+    console.log('[gic]', msg);
+    logLines.push(line);
+    if (logLines.length > 300) logLines.splice(0, logLines.length - 300);
+    try {
+      const p = ensurePanel();
+      const el = p.querySelector('.gicp-log');
+      if (el) {
+        el.textContent = logLines.slice(-80).join('\n') + '\n';
+        el.scrollTop = el.scrollHeight;
       }
-    })();
-    return true;
-  }
-
-  async function quickRun(useFolder) {
-    await runFlow(!!useFolder, '');
-  }
-
-  function showHelp() {
-    alert([
-      'Gemini /img 命令 — 使用帮助',
-      '',
-      '/img <提示词>     选图并执行（提示词可省略，用默认）',
-      '/imgf <提示词>    选择整个文件夹批量处理',
-      '/imgset <提示词>  设置默认提示词',
-      '/imgconf          切换「每张图新开对话」',
-      '/imgname          切换「严格原名 / 纠正扩展名」',
-      '/imgclear         停止并清除当前队列',
-      '/imgdiag          诊断页面元素（失效排查）',
-      '/imghelp          显示本帮助',
-      '',
-      '快捷键：Alt+G = 选图执行 / Alt+F = 选文件夹（用默认提示词）',
-      '流程：自动上传图片 → 发送提示词 → 等待生成 → 按原文件名下载',
-      '下载位置：浏览器「下载」文件夹'
-    ].join('\n'));
+    } catch (e) { /* 忽略 */ }
   }
 
   /* ---- 诊断（Google 改版后的排查工具） ---- */
@@ -977,106 +1089,44 @@
   }
 
   /* ============================================================
-   * 十、事件拦截（命令识别）
+   * 十、快捷键 / 菜单 / 启动
    * ============================================================ */
-  // 输入框内「命令 + 回车」：document-start 注册，抢在页面脚本之前
+  // Alt+G 打开/关闭配置面板
   document.addEventListener('keydown', (e) => {
-    if (e.key !== 'Enter' || e.shiftKey || e.ctrlKey || e.altKey || e.metaKey || e.isComposing) return;
-    const t = e.target;
-    if (!t || typeof t.closest !== 'function') return;
-    const editable = t.isContentEditable || t.tagName === 'TEXTAREA' ||
-      (t.tagName === 'INPUT' && (t.type === 'text' || t.type === 'search'));
-    if (!editable) return;
-    let text = '';
-    try { text = (t.isContentEditable ? t.innerText : t.value) || ''; } catch (err) { return; }
-    text = text.trim();
-    if (!CMDS.test(text)) return;
-    e.preventDefault();
-    e.stopImmediatePropagation();
-    clearEditor();
-    handleCommand(text);
-  }, true);
-
-  // 输入命令后点击「发送」按钮同样触发命令
-  document.addEventListener('click', (e) => {
-    const btn = (e.target && typeof e.target.closest === 'function') ? e.target.closest('button') : null;
-    if (!btn) return;
-    const ed = getEditor();
-    if (!ed) return;
-    const text = (ed.innerText || '').trim();
-    if (!CMDS.test(text)) return;
-    const sb = findSendButton();
-    const label = btn.getAttribute('aria-label') || '';
-    if (btn === sb || /发送|Send/i.test(label)) {
+    if (e.altKey && !e.ctrlKey && !e.metaKey && !e.shiftKey && (e.key === 'g' || e.key === 'G')) {
       e.preventDefault();
-      e.stopImmediatePropagation();
-      clearEditor();
-      handleCommand(text);
-    }
-  }, true);
-
-  // Alt+G（选图）/ Alt+F（选文件夹）快捷键
-  document.addEventListener('keydown', (e) => {
-    if (e.altKey && !e.ctrlKey && !e.metaKey && !e.shiftKey) {
-      const k = e.key.toLowerCase();
-      if (k === 'g') { e.preventDefault(); quickRun(false); }
-      else if (k === 'f') { e.preventDefault(); quickRun(true); }
+      togglePanel();
     }
   });
 
-  /* ============================================================
-   * 十一、Tampermonkey 菜单命令
-   * ============================================================ */
   try {
-    GM_registerMenuCommand('🖼 选图并执行（默认提示词）', () => quickRun(false));
-    GM_registerMenuCommand('📁 选整个文件夹批量处理（默认提示词）', () => quickRun(true));
-    GM_registerMenuCommand('✏️ 设置默认提示词', () => {
-      const p = window.prompt('默认提示词（/img 不带参数时使用）：', cfg.defaultPrompt || '');
-      if (p != null && p.trim()) { cfg.defaultPrompt = p.trim(); saveCfg(); toast('已保存默认提示词'); }
-    });
-    GM_registerMenuCommand('🔄 切换：每张图新开对话（当前 ' + (cfg.newChatPerImage ? '开' : '关') + '）', () => {
-      cfg.newChatPerImage = !cfg.newChatPerImage;
-      saveCfg();
-      toast('每张图新开对话：' + (cfg.newChatPerImage ? '开' : '关'));
-    });
-    GM_registerMenuCommand('🔤 切换：严格原文件名（当前 ' + (cfg.exactName ? '开' : '关') + '）', () => {
-      cfg.exactName = !cfg.exactName;
-      saveCfg();
-      toast(cfg.exactName ? '命名：严格使用原文件名' : '命名：原名 + 自动纠正扩展名');
-    });
-    GM_registerMenuCommand('📋 显示/隐藏状态面板', () => {
-      const p = ensurePanel();
-      p.style.display = (p.style.display === 'none' || !p.style.display) ? 'flex' : 'none';
-      const m = metaLoad();
-      if (m) renderList(m);
-    });
-    GM_registerMenuCommand('🗑 停止并清除队列', () => {
-      const q = metaLoad();
-      if (q && !q.done) { q.done = true; metaSave(q); releaseLock(); toast('已停止并清除队列'); }
-      else toast('当前没有执行中的队列');
-    });
+    GM_registerMenuCommand('🖼 打开/关闭配置面板', () => togglePanel());
+    GM_registerMenuCommand('⏹ 停止当前队列', () => stopQueue());
     GM_registerMenuCommand('🔍 诊断页面元素', () => runDiag());
   } catch (e) { /* 菜单注册失败不影响主功能 */ }
 
-  /* ============================================================
-   * 十二、启动：断点续跑 + 首次提示
-   * ============================================================ */
   async function boot() {
     if (document.readyState === 'loading') {
       await new Promise((r) => document.addEventListener('DOMContentLoaded', r, { once: true }));
     }
     await sleep(1500);
     try {
+      ensureLauncher();
+      ensurePanel();
       const m = metaLoad();
       if (m && !m.done) {
         log('↻ 检测到未完成的队列，自动续跑…');
+        panelShow();
         processQueue();
       } else if (!sessionStorage.getItem('gic-hint')) {
         sessionStorage.setItem('gic-hint', '1');
-        toast('已启用 /img 命令：/img 提示词 选图，/imgf 提示词 选文件夹（Alt+G / Alt+F）', 6000);
+        panelShow();
+        toast('已启用批量图片生成：在面板中选好文件夹、填好提示词，点「执行」即可', 6000);
+      } else {
+        updatePanelState();
       }
     } catch (e) {
-      console.error('[/img] boot:', e);
+      console.error('[gic] boot:', e);
     }
   }
 
