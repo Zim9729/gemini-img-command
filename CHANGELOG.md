@@ -5,6 +5,48 @@
 格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [2.1.2] - 2026-09-03
+
+### 修复
+
+- **下载 `Failed to fetch`**：Gemini 常把生成图渲染为 `blob:` 地址并在加载后 `revokeObjectURL`，事后 `fetch` 该地址必然失败。改为三级取数：`fetch` → `GM_xmlhttpRequest` → **直接把 `<img>` 画到 canvas 导出**（同源 blob:/data: 不会污染 canvas），全部失败才报错并把各步原因拼在一起。
+- **「严格原文件名」时真正对齐格式**：此前把 PNG 数据存成 `.jpg` 名仅打警告；现在用 `createImageBitmap` + canvas 按扩展名重编码（`.jpg` → JPEG 质量 0.95，`.png` → PNG，`.webp` → WebP），文件名与内容一致。
+
+## [2.1.1] - 2026-09-03
+
+### 修复
+
+- **上传误判（根因）**：`uploadViaPaste` 用 `dispatchEvent` 返回值判断成败，而 Gemini 接管粘贴时会 `preventDefault` → 返回 `false` → 成功被当失败、1 秒内直接抛错、提示词与发送全被跳过。改为只要事件派发成功就进入 `attached()` 检测等待（最多 12 秒）。
+- **附件检测改为全局识别预览元素**：此前只在 `composerRoot()` 内找新 `<img>`，而 Gemini 附件预览是 `rich-textarea` 的兄弟节点。改为全局找新出现的 `img[src^="blob:"]` / `uploader-file-preview` 等元素（排除回复区与本脚本面板）。
+- **`composerRoot()` 范围扩大**：增加 `input-container` / `input-area-v2` / `.input-area-container`，发送按钮、附件删除按钮、上传进度条都能在正确范围内找到。
+- **粘贴途径提到第一位**，file input 作为兜底（Gemini 是点「+」时才动态创建 file input）。
+- **上传进度等待**改为只看非回复区的可见进度条，稳定等待延长到 1.5 秒，避免图片还在上传就点发送。
+- 诊断新增「附件预览元素」计数，便于排查预览 DOM 结构变化。
+
+## [2.1.0] - 2026-09-03
+
+### 变更
+
+- **彻底去掉整页刷新**：此前每张图找不到「新对话」按钮就 `location.assign('/app')` 整页刷新续跑，叠加其它问题导致刷新循环。改为：按钮 → SPA 路由软跳转（`history.pushState('/app')` + `popstate`）→ 都失败则在当前对话继续并记录警告，绝不刷新页面。相关 `freshChat` / `gic-nav` 刷新续跑机制一并删除。
+- **「新对话」按钮识别扩大**：优先用 `data-test-id*="new-chat"` 组件与 `a[href="/app"]`，文案兜底改为 `/新(对话|聊天|会话)/` 与 `/new (chat|conversation)/i`，能匹配「发起新对话」。
+
+### 修复
+
+- **提示词输入三级兜底**：`execCommand('insertText')` → 模拟粘贴 `text/plain`（与图片粘贴同一通道）→ 直接写 DOM 并派发 `input` 事件；每级后重新定位编辑器并校验文本确实进入，成功才继续。
+- **编辑器定位只取可见元素**：此前 `querySelector('.ql-editor')` 取 DOM 第一个，可能命中隐藏实例导致文字进不去；现在过滤 `getClientRects()`，取最下方的可见者。
+- **每张开始前清掉残留附件**：失败后留在输入框里的图片 chip 会被移除，避免下一张叠加成两张；新对话步骤移进单张 try 块，失败只标记该张，不再中断整个队列。
+- 全选改用 Selection API，避免 `execCommand('selectAll')` 在焦点不对时选中整页。
+- 诊断新增「输入框候选/可见数量」，便于排查编辑器选择器。
+
+## [2.0.2] - 2026-09-03
+
+### 修复
+
+- **`GM_getValue`/`GM_setValue` 加 localStorage 回退**：脚本在 IIFE 顶层同步调用 `GM_getValue`，是唯一能在打印横幅后、创建按钮前直接抛错终止整个脚本的位置（如 Greasemonkey 4 只提供异步 `GM.*`）。回退后不再因此中止。
+- **`renderList` 的 `innerHTML` 改为 DOM API 构建**：Google 已下发 `require-trusted-types-for`（目前 Report-Only），一旦转正 `innerHTML = 字符串` 会抛 `TypeError` 中断 `processQueue`。改完后 `escapeHtml` 成死代码，一并删除。
+- **跨域图片直接走 `GM_xmlhttpRequest`**：不再先用页面 `fetch` 触发 CORS 报错刷屏，仅 `blob:`/`data:`/同源地址用 `fetch`。
+- 版本号 2.0.1 → 2.0.2，便于确认跑的是新文件而非缓存旧版。
+
 ## [2.0.1] - 2026-02-14
 
 ### 修复（可观测性与健壮性加固）

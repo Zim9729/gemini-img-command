@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Gemini 批量图片生成面板
 // @namespace    gemini-img-command
-// @version      2.0.1
+// @version      2.1.2
 // @description  gemini.google.com 批量图片生成配置面板：提前选好文件夹 + 填好提示词，点击「执行」自动循环每一张图（每图独立新对话）→ 等待生成 → 按原图文件名下载，直至全部完成。
 // @author       gemini-img-command
 // @match        https://gemini.google.com/*
@@ -38,7 +38,7 @@
   'use strict';
 
   /* ---- 版本标识与加载横幅（F12 控制台过滤 gic 即可确认脚本是否在运行） ---- */
-  const SCRIPT_VERSION = '2.0.1';
+  const SCRIPT_VERSION = '2.1.2';
   try {
     console.log('%c[gic] Gemini 批量图片生成面板 v' + SCRIPT_VERSION + ' 已加载',
       'color:#8ab4f8;font-weight:bold');
@@ -60,8 +60,21 @@
   function safeParse(s) {
     try { return JSON.parse(s) || {}; } catch (e) { return {}; }
   }
-  let cfg = Object.assign({}, DEFAULT_CFG, safeParse(GM_getValue('cfg', '{}')));
-  function saveCfg() { GM_setValue('cfg', JSON.stringify(cfg)); }
+  // GM_* 不可用（如 Greasemonkey 4 只提供异步 GM.*）时回退到 localStorage，避免脚本在此处直接中止
+  const gm = {
+    get(k, d) {
+      try { return GM_getValue(k, d); } catch (e) {
+        try { const v = localStorage.getItem('gic-gm:' + k); return v === null ? d : v; } catch (_) { return d; }
+      }
+    },
+    set(k, v) {
+      try { GM_setValue(k, v); } catch (e) {
+        try { localStorage.setItem('gic-gm:' + k, v); } catch (_) {}
+      }
+    }
+  };
+  let cfg = Object.assign({}, DEFAULT_CFG, safeParse(gm.get('cfg', '{}')));
+  function saveCfg() { gm.set('cfg', JSON.stringify(cfg)); }
 
   /* ============================================================
    * 二、基础工具
@@ -80,12 +93,6 @@
         else if (Date.now() - t0 >= timeout) { clearInterval(timer); resolve(null); }
       }, step);
     });
-  }
-
-  function escapeHtml(s) {
-    return String(s).replace(/[&<>"']/g, (c) => ({
-      '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
-    }[c]));
   }
 
   function toast(msg, ms) {
@@ -164,14 +171,9 @@
   function lockInfo() {
     try { return JSON.parse(localStorage.getItem('gic-lock') || 'null'); } catch (e) { return null; }
   }
-  function navRecent() {
-    const t = Number(localStorage.getItem('gic-nav') || 0);
-    return !!t && Date.now() - t < 60000;
-  }
   function tryAcquireLock() {
     const lk = lockInfo();
-    if (lk && lk.tab !== TAB_ID && Date.now() - lk.ts < 15000 && !navRecent()) return false;
-    try { localStorage.removeItem('gic-nav'); } catch (e) {}
+    if (lk && lk.tab !== TAB_ID && Date.now() - lk.ts < 15000) return false;
     heartbeat();
     return true;
   }
@@ -188,21 +190,32 @@
   /* ============================================================
    * 四、页面 DOM 定位（多层选择器 + 兜底）
    * ============================================================ */
+  const isVisible = (el) => !!el && el.getClientRects().length > 0;
+
+  const EDITOR_SELS = [
+    'rich-textarea .ql-editor',                                  // Quill 编辑器（Gemini 输入框）
+    '.ql-editor',
+    'rich-textarea [contenteditable="true"]',
+    'main [contenteditable="true"][role="textbox"]',
+    'form [contenteditable="true"]',
+    '#editor [contenteditable="true"]',
+    'div[contenteditable="true"][role="textbox"]'
+  ];
+
   function getEditor() {
-    return document.querySelector('.ql-editor')                       // Quill 编辑器（Gemini 输入框）
-      || document.querySelector('rich-textarea [contenteditable="true"]')
-      || document.querySelector('main [contenteditable="true"][role="textbox"]')
-      || document.querySelector('form [contenteditable="true"]')
-      || document.querySelector('#editor [contenteditable="true"]')
-      || document.querySelector('div[contenteditable="true"][role="textbox"]')
-      || null;
+    // 只取可见的；页面上可能同时存在隐藏的编辑器实例，主输入框通常在最下方
+    for (const sel of EDITOR_SELS) {
+      const list = [...document.querySelectorAll(sel)].filter(isVisible);
+      if (list.length) return list[list.length - 1];
+    }
+    return null;
   }
 
   function composerRoot() {
     const ed = getEditor();
     if (!ed) return null;
-    return ed.closest('form')
-      || ed.closest('.chat-input-container')
+    // Gemini 的附件预览、发送按钮与 rich-textarea 是兄弟节点，需向上找到整个输入区组件
+    return ed.closest('input-container, input-area-v2, .input-area-container, form, .chat-input-container, .input-area')
       || (ed.parentElement && ed.parentElement.parentElement)
       || null;
   }
@@ -267,28 +280,38 @@
   }
 
   function tryFindNewChatButton() {
-    const pats = [/^新聊天/, /^新对话/, /^新建对话/, /^New chat/i, /^Start new chat/i];
-    const els = [...document.querySelectorAll('button, a')];
+    // 优先：Gemini 侧栏的新对话组件（data-test-id）
+    const direct = [...document.querySelectorAll(
+      '[data-test-id*="new-chat"] button, button[data-test-id*="new-chat"], [data-test-id*="new-chat"], a[href="/app"]'
+    )].filter(isVisible);
+    if (direct.length) return direct[0];
+    // 兜底：按文案匹配（新对话 / 发起新对话 / 新聊天 / New chat / New conversation）
+    const pats = [/新(对话|聊天|会话)/, /new (chat|conversation)/i];
+    const els = [...document.querySelectorAll('button, a, [role="button"], mat-list-item')];
     for (const el of els) {
-      const label = ((el.getAttribute('aria-label') || '') + ' ' + (el.textContent || '')).trim();
+      const label = ((el.getAttribute('aria-label') || '') + ' ' + (el.getAttribute('mattooltip') || '') + ' ' + (el.textContent || '')).trim();
       if (!label || label.length > 40) continue;
-      if (pats.some((p) => p.test(label))) {
-        if (el.offsetParent !== null || el.getClientRects().length) return el;
-      }
+      if (pats.some((p) => p.test(label)) && isVisible(el)) return el;
     }
     return null;
   }
 
+  const isFreshChat = () => !!getEditor() && (/^\/app\/?$/.test(location.pathname) || countResponses() === 0);
+
+  // 不做整页刷新：按钮 → SPA 路由软跳转 → 都失败则返回 false，由调用方决定是否在当前对话继续
   async function tryStartNewChat() {
+    if (isFreshChat()) return true;
     const b = tryFindNewChatButton();
-    if (!b) return false;
-    b.click();
-    const ok = await waitFor(() => {
-      const urlOk = /^\/app\/?$/.test(location.pathname);
-      const emptyOk = countResponses() === 0;
-      return !!getEditor() && (urlOk || emptyOk);
-    }, 12000, 500);
-    return !!ok;
+    if (b) {
+      b.click();
+      if (await waitFor(isFreshChat, 12000, 500)) return true;
+    }
+    try {
+      history.pushState({}, '', '/app');
+      window.dispatchEvent(new PopStateEvent('popstate', { state: {} }));
+      if (await waitFor(isFreshChat, 8000, 500)) return true;
+    } catch (e) { /* 忽略 */ }
+    return false;
   }
 
   /* ---- 回复定位与生成图识别 ---- */
@@ -317,31 +340,93 @@
   /* ============================================================
    * 五、动作：输入、上传、发送、等待
    * ============================================================ */
+  // 用 Selection API 全选编辑器内容（比 execCommand('selectAll') 可靠：后者在焦点不在编辑器内时会选中整页）
+  function selectAllIn(ed) {
+    ed.focus();
+    const sel = window.getSelection();
+    const range = document.createRange();
+    range.selectNodeContents(ed);
+    sel.removeAllRanges();
+    sel.addRange(range);
+  }
+
+  // 移除输入区里残留的附件（上一张失败后留下的图片 chip），避免下一张叠加成两张
+  async function clearAttachments() {
+    const root = composerRoot();
+    if (!root) return;
+    const sels = [
+      'button[aria-label*="移除"]', 'button[aria-label*="删除"]', 'button[aria-label*="Remove"]', 'button[aria-label*="Delete"]',
+      'button[mattooltip*="移除"]', 'button[mattooltip*="Remove"]'
+    ];
+    for (let n = 0; n < 5; n++) {
+      const b = sels.map((s) => [...root.querySelectorAll(s)].filter(isVisible)[0]).find(Boolean);
+      if (!b) break;
+      b.click();
+      await sleep(300);
+    }
+  }
+
   async function clearEditor() {
+    await clearAttachments();
     const ed = getEditor();
     if (!ed) return;
     try {
-      ed.focus();
-      document.execCommand('selectAll', false, null);
+      selectAllIn(ed);
       document.execCommand('delete', false, null);
     } catch (e) { /* 忽略 */ }
     await sleep(200);
   }
 
-  async function setPrompt(text) {
+  const normWs = (s) => String(s || '').replace(/\s+/g, ' ').trim();
+
+  function editorHasText(text) {
     const ed = getEditor();
-    if (!ed) throw new Error('找不到输入框');
-    ed.focus();
-    document.execCommand('selectAll', false, null);
-    document.execCommand('insertText', false, text);
-    await sleep(400);
-    if (!(ed.innerText || '').includes(text.slice(0, 12))) {
-      ed.focus();
-      document.execCommand('selectAll', false, null);
-      document.execCommand('insertText', false, text);
-      await sleep(400);
-      if (!(ed.innerText || '').includes(text.slice(0, 12))) throw new Error('无法输入提示词');
+    if (!ed) return false;
+    const want = normWs(text).slice(0, 12);
+    return !!want && normWs(ed.innerText || ed.textContent).includes(want);
+  }
+
+  // 三级兜底：execCommand → 模拟粘贴纯文本 → 直接写 DOM（Quill 有 MutationObserver 会同步）
+  async function setPrompt(text) {
+    const strategies = [
+      ['execCommand', (ed) => {
+        selectAllIn(ed);
+        document.execCommand('insertText', false, text);
+      }],
+      ['paste', (ed) => {
+        selectAllIn(ed);
+        const dt = new DataTransfer();
+        dt.setData('text/plain', text);
+        ed.dispatchEvent(new ClipboardEvent('paste', { bubbles: true, cancelable: true, clipboardData: dt }));
+      }],
+      ['dom', (ed) => {
+        ed.focus();
+        ed.textContent = '';
+        const p = document.createElement('p');
+        p.textContent = text;
+        ed.appendChild(p);
+        ed.classList.remove('ql-blank');
+        ed.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'insertText', data: text }));
+        // 光标放到末尾，便于后续操作
+        const sel = window.getSelection();
+        const range = document.createRange();
+        range.selectNodeContents(p);
+        range.collapse(false);
+        sel.removeAllRanges();
+        sel.addRange(range);
+      }]
+    ];
+    for (const [name, fn] of strategies) {
+      const ed = getEditor();
+      if (!ed) throw new Error('找不到输入框');
+      try { fn(ed); } catch (e) { log('  ⚠ 输入提示词（' + name + '）异常：' + ((e && e.message) || e)); }
+      await sleep(500);
+      if (editorHasText(text)) {
+        if (name !== 'execCommand') log('  ⌨ 提示词已填入（' + name + ' 方式）');
+        return;
+      }
     }
+    throw new Error('无法输入提示词（三种方式均失败，请点「诊断」并反馈）');
   }
 
   function uploadViaPaste(file) {
@@ -352,30 +437,42 @@
       const dt = new DataTransfer();
       dt.items.add(file);
       const ev = new ClipboardEvent('paste', { bubbles: true, cancelable: true, clipboardData: dt });
-      return ed.dispatchEvent(ev);
+      // 注意：dispatchEvent 在页面 preventDefault（= Gemini 已接管粘贴）时返回 false，
+      // 所以不能用返回值判断成败，只要派发没抛异常就算「已尝试」，成败交给 attached() 检测
+      ed.dispatchEvent(ev);
+      return true;
     } catch (e) { return false; }
   }
 
+  // 附件预览：Gemini 的本地预览图是 blob:/data: 地址（生成图是 https://lh3…，不会混淆）
+  const PREVIEW_SEL = 'uploader-file-preview, uploader-file-preview-container, [data-test-id*="file-preview"], [data-test-id*="uploaded"], .file-preview, img[src^="blob:"], img[src^="data:image"]';
+  const inResponseArea = (el) => !!el.closest(RESP_SELS + ', user-query, .query-content');
+
   async function uploadSettle() {
-    // 等上传进度指示消失（选择器不匹配时直接放行，不作为失败条件）
-    await waitFor(() => {
-      const r = composerRoot();
-      return !!r && !r.querySelector('mat-progress-spinner, mat-spinner, [role="progressbar"]');
-    }, cfg.uploadTimeoutMs, 800);
-    await sleep(1000);
+    // 等上传进度指示消失（只看非回复区域；选择器不匹配时直接放行，不作为失败条件）
+    await waitFor(() => ![...document.querySelectorAll('mat-progress-spinner, mat-spinner, mat-progress-bar, [role="progressbar"]')]
+      .some((p) => isVisible(p) && !inResponseArea(p)), cfg.uploadTimeoutMs, 800);
+    await sleep(1500);
   }
 
   async function uploadFile(file) {
     const nameKey = (file.name.replace(/\.[^.]+$/, '') || file.name).slice(0, 8);
-    const beforeImgs = new Set([...(composerRoot() || document).querySelectorAll('img')].map((x) => x.src));
+    const before = new Set(document.querySelectorAll(PREVIEW_SEL));
     const attached = () => {
       const r = composerRoot();
-      if (!r) return false;
-      if ((r.textContent || '').includes(nameKey)) return true;                       // 出现文件名 chip
-      return [...r.querySelectorAll('img')].some((x) => !beforeImgs.has(x.src) && x.complete); // 或出现新预览图
+      if (r && (r.textContent || '').includes(nameKey)) return true;                 // 出现文件名 chip
+      return [...document.querySelectorAll(PREVIEW_SEL)]                              // 或出现新的预览元素
+        .some((el) => !before.has(el) && isVisible(el) && !inResponseArea(el) && !panelEl?.contains(el));
     };
 
-    // 途径 1：页面上的 file input（优先 accept 含 image 的）
+    // 途径 1：向编辑器模拟「粘贴」（Gemini 会接管 paste 事件并附加文件）
+    if (uploadViaPaste(file) && await waitFor(attached, 12000, 500)) {
+      await uploadSettle();
+      log('  ⬆ 已附加（粘贴方式）：' + file.name);
+      return;
+    }
+
+    // 途径 2：页面上已存在的 file input（优先 accept 含 image 的）
     const inputs = [...document.querySelectorAll('input[type="file"]')]
       .sort((a, b) => ((b.accept || '').includes('image') ? 1 : 0) - ((a.accept || '').includes('image') ? 1 : 0))
       .slice(0, 3);
@@ -393,14 +490,7 @@
       }
     }
 
-    // 途径 2：向编辑器模拟「粘贴」
-    if (uploadViaPaste(file) && await waitFor(attached, 12000, 500)) {
-      await uploadSettle();
-      log('  ⬆ 已附加（粘贴方式）：' + file.name);
-      return;
-    }
-
-    throw new Error('无法把图片放入输入框（未找到可用上传入口）');
+    throw new Error('无法把图片放入输入框（粘贴与 file input 均未检测到附件预览，请点「诊断」反馈）');
   }
 
   async function sendAndWait() {
@@ -448,27 +538,61 @@
     return null;
   }
 
-  async function fetchImageBlob(img) {
-    const src = img.currentSrc || img.src || '';
-    if (!src) throw new Error('图片地址为空');
-    if (src.startsWith('blob:') || src.startsWith('data:')) {
-      const r = await fetch(src);
-      if (!r.ok) throw new Error('HTTP ' + r.status);
-      return await r.blob();
-    }
-    try {
-      const r = await fetch(src, { credentials: 'include' });
-      if (r.ok) return await r.blob();
-    } catch (e) { /* 跨域受限，改走 GM_xmlhttpRequest */ }
-    return await new Promise((resolve, reject) => {
+  const MIME_BY_EXT = { png: 'image/png', jpg: 'image/jpeg', jpeg: 'image/jpeg', webp: 'image/webp' };
+
+  function gmFetchBlob(url) {
+    return new Promise((resolve, reject) => {
       GM_xmlhttpRequest({
         method: 'GET',
-        url: src,
+        url: url,
         responseType: 'blob',
         onload: (r) => (r.status >= 200 && r.status < 300) ? resolve(r.response) : reject(new Error('HTTP ' + r.status)),
-        onerror: () => reject(new Error('下载图片失败（网络或跨域受限）'))
+        onerror: () => reject(new Error('网络或跨域受限'))
       });
     });
+  }
+
+  // 把可绘制对象（<img> 或 ImageBitmap）导出为指定格式的 Blob
+  function drawToBlob(source, w, h, ext) {
+    return new Promise((resolve, reject) => {
+      try {
+        const c = document.createElement('canvas');
+        c.width = w; c.height = h;
+        c.getContext('2d').drawImage(source, 0, 0);
+        c.toBlob((b) => (b ? resolve(b) : reject(new Error('canvas 导出为空'))), MIME_BY_EXT[ext] || 'image/png', 0.95);
+      } catch (e) { reject(new Error('canvas 读取失败（' + ((e && e.name) || e) + '）')); }
+    });
+  }
+
+  // 取生成图数据。Gemini 常把生成图渲染为 blob: 地址并在加载后 revoke，此时 fetch 会 "Failed to fetch"，
+  // 但 <img> 仍持有像素，可直接画到 canvas 导出（同源 blob:/data: 不会污染 canvas）
+  async function fetchImageBlob(img, ext) {
+    const src = img.currentSrc || img.src || '';
+    if (!src) throw new Error('图片地址为空');
+    const errors = [];
+    const isLocal = src.startsWith('blob:') || src.startsWith('data:') || src.startsWith(location.origin + '/');
+    if (isLocal) {
+      try {
+        const r = await fetch(src);
+        if (!r.ok) throw new Error('HTTP ' + r.status);
+        return await r.blob();
+      } catch (e) { errors.push('fetch：' + ((e && e.message) || e)); }
+    } else {
+      try { return await gmFetchBlob(src); } catch (e) { errors.push('GM_xhr：' + ((e && e.message) || e)); }
+    }
+    try {
+      const b = await drawToBlob(img, img.naturalWidth, img.naturalHeight, ext);
+      log('  🖌 已从页面图像元素直接导出（' + img.naturalWidth + '×' + img.naturalHeight + '）');
+      return b;
+    } catch (e) { errors.push((e && e.message) || String(e)); }
+    throw new Error('下载图片失败：' + errors.join('；'));
+  }
+
+  // 已拿到的图片数据重编码为目标扩展名对应的格式（保证「原文件名 .jpg」里装的确实是 JPEG）
+  async function convertBlob(blob, ext) {
+    if (!MIME_BY_EXT[ext]) return blob;
+    const bm = await createImageBitmap(blob);
+    try { return await drawToBlob(bm, bm.width, bm.height, ext); } finally { bm.close(); }
   }
 
   function saveBlob(blob, filename) {
@@ -486,15 +610,20 @@
     const p = splitName(origName);
     for (let i = 0; i < imgs.length; i++) {
       const suffix = imgs.length > 1 ? (i === 0 ? '' : '_' + (i + 1)) : '';
-      const blob = await fetchImageBlob(imgs[i]);
+      let blob = await fetchImageBlob(imgs[i], p.ext);
       if (!blob || blob.size < 1024) throw new Error('下载的图片数据异常');
       const realExt = blobExt(blob);
       let useExt = p.ext;
-      if (!cfg.exactName && realExt && realExt !== p.ext) useExt = realExt;
-      const filename = p.base + suffix + '.' + useExt;
-      if (realExt && realExt !== useExt) {
-        log('  ⚠ 生成图实际为 ' + realExt.toUpperCase() + ' 格式，文件名保留 .' + useExt + '（面板选项可切换）');
+      if (realExt && realExt !== p.ext && realExt !== 'gif') {
+        if (cfg.exactName) {
+          // 严格原文件名：把数据转成扩展名对应的格式，而不是把 PNG 数据存成 .jpg
+          try { blob = await convertBlob(blob, p.ext); log('  🔁 已将 ' + realExt.toUpperCase() + ' 转为 ' + p.ext.toUpperCase()); }
+          catch (e) { log('  ⚠ 格式转换失败，按原始 ' + realExt.toUpperCase() + ' 数据保存为 .' + p.ext); }
+        } else {
+          useExt = realExt;
+        }
       }
+      const filename = p.base + suffix + '.' + useExt;
       saveBlob(blob, filename);
       log('  💾 已下载：' + filename);
       await sleep(1000); // 避免浏览器下载节流
@@ -519,7 +648,6 @@
       statuses: names.map(() => 'pending'),
       errors: {},
       idx: 0,
-      freshChat: false,
       done: false
     };
     metaSave(meta);
@@ -545,7 +673,6 @@
     if (!m || m.done) return;
     if (!tryAcquireLock()) { log('⏸ 其他标签页正在处理队列'); return; }
     localRunning = true;
-    let navigating = false;
     const hb = setInterval(heartbeat, 5000);
     try {
       panelShow();
@@ -558,30 +685,15 @@
         if (!cur || cur.done) { log('⏹ 队列已被停止'); return; }
         if (m.statuses[i] === 'ok' || m.statuses[i] === 'err') continue;
 
-        if (cfg.newChatPerImage) {
-          if (m.freshChat) {
-            m.freshChat = false;
-            metaSave(m);
-          } else {
-            log('  ↗ 新开对话…');
-            const clicked = await tryStartNewChat();
-            if (!clicked) {
-              // 找不到「新对话」按钮：跳转到 /app（新对话页），刷新后自动续跑
-              m.freshChat = true;
-              m.idx = i;
-              metaSave(m);
-              try { localStorage.setItem('gic-nav', String(Date.now())); } catch (e) {}
-              navigating = true;
-              log('  ↻ 未找到「新对话」按钮，刷新页面以进入新对话…');
-              location.assign('/app');
-              return;
-            }
-          }
-        }
-
         panelSetState(m, i, 'busy');
         log('▶ [' + (i + 1) + '/' + m.names.length + '] ' + m.names[i]);
         try {
+          if (cfg.newChatPerImage) {
+            log('  ↗ 新开对话…');
+            if (!(await tryStartNewChat())) log('  ⚠ 无法进入新对话（未找到按钮），本张在当前对话中继续');
+            // 新对话切换后编辑器会重建，等它就绪
+            if (!(await waitFor(() => !!getEditor() && !!composerRoot(), 15000, 500))) throw new Error('新对话页面输入框未就绪');
+          }
           await processOne(i, m.prompt, m.names[i]);
           m.statuses[i] = 'ok';
           panelSetState(m, i, 'ok');
@@ -608,7 +720,7 @@
     } finally {
       clearInterval(hb);
       localRunning = false;
-      if (!navigating) releaseLock();
+      releaseLock();
       updatePanelState();
     }
   }
@@ -1028,14 +1140,22 @@
     const list = panelEl.querySelector('.gicp-list');
     if (!list) return;
     const icons = { pending: '⏸', busy: '⏳', ok: '✅', err: '❌' };
-    let html = m.names.map((n, i) => {
+    // 用 DOM API 构建而非 innerHTML：gemini.google.com 已下发 require-trusted-types-for（目前为 Report-Only），
+    // 一旦正式启用，innerHTML 赋字符串会抛 TypeError 并中断队列
+    list.textContent = '';
+    m.names.forEach((n, i) => {
       const st = m.statuses[i] || 'pending';
       const err = m.errors && m.errors[i];
-      return '<div>【' + (icons[st] || '⏸') + '】' + (i + 1) + '. ' + escapeHtml(n) +
-        (st === 'err' && err ? ' <span style="color:#f28b82">' + escapeHtml(String(err).slice(0, 50)) + '</span>' : '') +
-        '</div>';
-    }).join('');
-    list.innerHTML = html;
+      const row = document.createElement('div');
+      row.textContent = '【' + (icons[st] || '⏸') + '】' + (i + 1) + '. ' + n;
+      if (st === 'err' && err) {
+        const span = document.createElement('span');
+        span.style.color = '#f28b82';
+        span.textContent = ' ' + String(err).slice(0, 50);
+        row.appendChild(span);
+      }
+      list.appendChild(row);
+    });
   }
 
   function panelSetState(m, i, status) {
@@ -1077,7 +1197,8 @@
     lines.push('文件夹选择方式：' + (typeof window.showDirectoryPicker === 'function' ? '原生 API ✅' : '上传控件（兜底）'));
     lines.push('userActivation：' + (navigator.userActivation ? '支持' : '不支持（旧浏览器）'));
     const ed = getEditor();
-    lines.push('输入框：' + (ed ? '✅ ' + describeEl(ed) : '❌ 未找到'));
+    const allEds = document.querySelectorAll(EDITOR_SELS.join(','));
+    lines.push('输入框：' + (ed ? '✅ ' + describeEl(ed) : '❌ 未找到') + '（候选 ' + allEds.length + ' 个，可见 ' + [...allEds].filter(isVisible).length + ' 个）');
     const cr = composerRoot();
     lines.push('输入区容器：' + (cr ? '✅ ' + describeEl(cr) : '❌ 未找到'));
     const sb = findSendButton();
@@ -1086,6 +1207,7 @@
     lines.push('新对话按钮：' + (ncb ? '✅ ' + (ncb.getAttribute('aria-label') || (ncb.textContent || '').trim().slice(0, 20)) : '❌ 未找到'));
     const inputs = [...document.querySelectorAll('input[type="file"]')];
     lines.push('文件输入框：' + inputs.length + ' 个');
+    lines.push('附件预览元素（blob 图/预览组件）：' + [...document.querySelectorAll(PREVIEW_SEL)].filter((el) => isVisible(el) && !inResponseArea(el)).length + ' 个');
     inputs.slice(0, 3).forEach((i) => lines.push('  - accept=' + (i.accept || '(空)')));
     lines.push('回复容器数量：' + countResponses());
     const bigImgs = [...document.querySelectorAll('img')].filter((i) => (i.naturalWidth || 0) >= cfg.minImgSize);
