@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Gemini 图片生成命令 (/img)
 // @namespace    gemini-img-command
-// @version      1.1.0
+// @version      1.2.0
 // @description  在 gemini.google.com 输入 /img 或 /imgf（整文件夹批量）：自动选图上传 → 发送 → 等待生成 → 按原图文件名下载。支持多图排队、每图独立新对话、断点续跑、诊断工具。
 // @author       gemini-img-command
 // @match        https://gemini.google.com/*
@@ -716,51 +716,160 @@
    * ============================================================ */
   const CMDS = /^\/(imgf|img|imgset|imgconf|imgname|imgclear|imgdiag|imghelp)\b\s*([\s\S]*)$/i;
 
-  function pickFiles() {
-    return new Promise((resolve) => {
-      const inp = document.createElement('input');
-      inp.type = 'file';
-      inp.multiple = true;
-      inp.accept = 'image/*';
-      inp.style.cssText = 'position:fixed;left:-9999px;top:0;';
-      (document.body || document.documentElement).appendChild(inp);
-      const finish = (files) => { try { inp.remove(); } catch (e) {} resolve(files); };
-      inp.addEventListener('change', () => finish([...inp.files]), { once: true });
-      inp.addEventListener('cancel', () => finish([]), { once: true });
-      inp.click();
-    });
+  /* ---- 选择图片/文件夹（三层兜底：原生API → input控件 → 页面内按钮） ---- */
+  function isImageName(name) {
+    if (!name || name.startsWith('.')) return false;
+    const m = String(name).match(/\.([A-Za-z0-9]+)$/);
+    return !!m && ['jpg', 'jpeg', 'png', 'webp', 'gif', 'bmp'].indexOf(m[1].toLowerCase()) >= 0;
   }
 
-  /* ---- 文件夹选择（递归抓取所有图片，自动忽略非图片文件） ---- */
   function isImageFile(f) {
     if (!f || !f.name || f.name.startsWith('.')) return false;
-    const m = f.name.match(/\.([A-Za-z0-9]+)$/);
-    const ext = m ? m[1].toLowerCase() : '';
-    if (['jpg', 'jpeg', 'png', 'webp', 'gif', 'bmp'].indexOf(ext) >= 0) return true;
-    return !!(f.type && f.type.indexOf('image/') === 0);
+    return isImageName(f.name) || !!(f.type && f.type.indexOf('image/') === 0);
   }
 
-  function pickFolder() {
+  async function walkDir(dir, prefix, out) {
+    for await (const entry of dir.values()) {
+      try {
+        if (entry.kind === 'directory') {
+          await walkDir(entry, prefix + entry.name + '/', out);
+        } else if (entry.kind === 'file' && isImageName(entry.name)) {
+          const f = await entry.getFile();
+          if (isImageFile(f)) out.push({ file: f, path: prefix + entry.name });
+        }
+      } catch (e) { /* 单个文件读取失败，跳过 */ }
+    }
+  }
+
+  function pickerViaInput(folder) {
     return new Promise((resolve) => {
       const inp = document.createElement('input');
       inp.type = 'file';
-      inp.multiple = true;
-      inp.accept = 'image/*';
-      try {
-        inp.setAttribute('webkitdirectory', '');
-        inp.setAttribute('directory', '');
-      } catch (e) { /* 忽略 */ }
+      if (folder) {
+        try { inp.webkitdirectory = true; } catch (e) {}
+        try { inp.setAttribute('webkitdirectory', ''); } catch (e) {}
+        try { inp.setAttribute('directory', ''); } catch (e) {}
+      } else {
+        inp.multiple = true;
+        inp.accept = 'image/*';
+      }
       inp.style.cssText = 'position:fixed;left:-9999px;top:0;';
       (document.body || document.documentElement).appendChild(inp);
-      const finish = (files) => { try { inp.remove(); } catch (e) {} resolve(files); };
+
+      let done = false, blurred = false;
+      const finish = (v) => {
+        if (done) return;
+        done = true;
+        clearTimeout(blockTimer);
+        clearInterval(focusPoll);
+        window.removeEventListener('blur', onBlur);
+        try { inp.remove(); } catch (e) {}
+        resolve(v);
+      };
+      const onBlur = () => { blurred = true; };
+      window.addEventListener('blur', onBlur);
+      // 2.5 秒内既未弹窗（无 blur）也未被取消 → 判定被浏览器拦截
+      const blockTimer = setTimeout(() => { if (!done && !blurred) finish({ blocked: true }); }, 2500);
+      // 对话框关闭后（焦点回来）若 800ms 内没有 change 事件，视为取消
+      const focusPoll = setInterval(() => {
+        if (done || !blurred) return;
+        if (document.hasFocus()) setTimeout(() => { if (!done) finish({ files: [] }); }, 800);
+      }, 500);
+
       inp.addEventListener('change', () => {
-        const imgs = [...inp.files].filter(isImageFile)
-          .sort((a, b) => String(a.webkitRelativePath || a.name).localeCompare(String(b.webkitRelativePath || b.name), 'zh-CN'));
-        finish(imgs);
+        const all = [...inp.files];
+        const files = folder
+          ? all.filter(isImageFile).sort((a, b) =>
+              String(a.webkitRelativePath || a.name).localeCompare(String(b.webkitRelativePath || b.name), 'zh-CN'))
+          : all;
+        finish({ files: files, paths: files.map((f) => f.webkitRelativePath || f.name) });
       }, { once: true });
-      inp.addEventListener('cancel', () => finish([]), { once: true });
+      inp.addEventListener('cancel', () => finish({ files: [] }), { once: true });
       inp.click();
     });
+  }
+
+  function pickerViaButton(folder) {
+    return new Promise((resolve) => {
+      const mask = document.createElement('div');
+      mask.style.cssText = 'position:fixed;inset:0;z-index:2147483647;background:rgba(0,0,0,.55);display:flex;align-items:center;justify-content:center';
+      const box = document.createElement('div');
+      box.style.cssText = 'background:#1e1f22;color:#e3e3e3;border:1px solid #3c4043;border-radius:12px;padding:22px 26px;max-width:420px;font:14px/1.7 system-ui,sans-serif;text-align:center';
+      const title = document.createElement('div');
+      title.style.cssText = 'font-weight:600;margin-bottom:6px';
+      title.textContent = folder ? '选择文件夹' : '选择图片';
+      const tip = document.createElement('div');
+      tip.style.cssText = 'color:#9aa0a6;margin-bottom:16px';
+      tip.textContent = '浏览器不允许脚本自动打开系统选择框，请点击下面的按钮：';
+      const btn = document.createElement('button');
+      btn.textContent = folder ? '📁 点击选择文件夹' : '🖼 点击选择图片';
+      btn.style.cssText = 'background:#8ab4f8;color:#202124;border:0;border-radius:8px;padding:10px 22px;font-size:14px;font-weight:600;cursor:pointer';
+      const cancel = document.createElement('button');
+      cancel.textContent = '取消';
+      cancel.style.cssText = 'margin-left:10px;background:none;color:#9aa0a6;border:0;cursor:pointer;font-size:14px';
+      box.appendChild(title); box.appendChild(tip); box.appendChild(btn); box.appendChild(cancel);
+      mask.appendChild(box);
+      (document.body || document.documentElement).appendChild(mask);
+      let settled = false;
+      const close = () => { if (!settled) { settled = true; mask.remove(); } };
+      cancel.addEventListener('click', () => { close(); resolve(null); });
+      btn.addEventListener('click', async () => {
+        settled = true;
+        mask.remove();
+        const r = await pickerViaInput(folder);
+        resolve(r && !r.blocked ? r : null);
+      });
+    });
+  }
+
+  async function chooseImages(folder) {
+    // 第一层：原生文件夹选择 API（Chrome / Edge）
+    if (folder && typeof window.showDirectoryPicker === 'function') {
+      const ua = navigator.userActivation;
+      if (!ua || ua.transient) {
+        try {
+          const dir = await window.showDirectoryPicker({ mode: 'read' });
+          const out = [];
+          await walkDir(dir, '', out);
+          out.sort((a, b) => a.path.localeCompare(b.path, 'zh-CN'));
+          return { files: out.map((o) => o.file), paths: out.map((o) => o.path) };
+        } catch (e) {
+          if (e && e.name === 'AbortError') return null; // 用户取消
+          log('⚠ 原生文件夹选择不可用（' + ((e && e.name) || e) + '），改用上传控件');
+        }
+      }
+    }
+    // 第二层：input 控件；第三层：缺少用户手势或被拦截时，弹出页面内按钮
+    const ua2 = navigator.userActivation;
+    let r = null;
+    if (!ua2 || ua2.transient) {
+      r = await pickerViaInput(folder);
+      if (r && r.blocked) r = null;
+    }
+    if (!r) r = await pickerViaButton(folder);
+    if (!r || r.blocked) return null;
+    return r;
+  }
+
+  async function runFlow(folder, promptArg) {
+    const q = metaLoad();
+    if (q && !q.done) { toast('已有队列在执行中（/imgclear 可停止）'); return; }
+    toast(folder ? '📂 请在弹出的窗口中选择文件夹…' : '🖼 请在弹出的窗口中选择图片…', 4000);
+    // 注意：必须先弹选择框（要在用户手势内），之后再询问提示词
+    const picked = await chooseImages(folder);
+    if (!picked || !picked.files.length) { toast('未选择图片，已取消'); return; }
+    let prompt = (promptArg || cfg.defaultPrompt || '').trim();
+    if (!prompt) {
+      prompt = (window.prompt('请输入提示词（也可先用 /imgset 保存默认提示词）：', '') || '').trim();
+      if (!prompt) { toast('已取消：未输入提示词'); return; }
+    }
+    if (folder) {
+      const folderName = String(picked.paths[0] || '').split('/')[0] || '(未知)';
+      log('📂 文件夹：' + folderName + '，共 ' + picked.files.length + ' 张图片');
+      if (picked.files.length > 80) toast('提示：一次排队 ' + picked.files.length + ' 张，如遇浏览器存储不足可分批处理', 6000);
+    }
+    toast('已加入队列：' + picked.files.length + ' 张图片，开始自动处理…');
+    await startRun(picked.files, prompt);
   }
 
   function handleCommand(text) {
@@ -771,21 +880,7 @@
     (async () => {
       try {
         if (cmd === 'img' || cmd === 'imgf') {
-          let prompt = arg || cfg.defaultPrompt;
-          if (!prompt || !prompt.trim()) {
-            prompt = (window.prompt('请输入提示词（也可先用 /imgset 保存默认提示词）：', '') || '').trim();
-            if (!prompt) { toast('已取消'); return; }
-          }
-          const files = (cmd === 'imgf') ? (await pickFolder()) : (await pickFiles());
-          if (!files.length) { toast('未选择图片，已取消'); return; }
-          if (cmd === 'imgf') {
-            const rel = files[0].webkitRelativePath || '';
-            const folder = rel.includes('/') ? rel.split('/')[0] : '';
-            log('📂 文件夹：' + (folder || '(未知)') + '，共 ' + files.length + ' 张图片');
-            if (files.length > 80) toast('提示：一次排队 ' + files.length + ' 张，如遇浏览器存储不足可分批处理', 6000);
-          }
-          toast('已加入队列：' + files.length + ' 张图片，开始自动处理…');
-          await startRun(files, prompt);
+          await runFlow(cmd === 'imgf', arg);
         } else if (cmd === 'imgset') {
           if (arg) {
             cfg.defaultPrompt = arg;
@@ -822,23 +917,7 @@
   }
 
   async function quickRun(useFolder) {
-    const q = metaLoad();
-    if (q && !q.done) { toast('已有队列在执行中（/imgclear 可停止）'); return; }
-    let prompt = (cfg.defaultPrompt || '').trim();
-    if (!prompt) {
-      prompt = (window.prompt('请输入提示词（可用 /imgset 保存默认提示词）：', '') || '').trim();
-      if (!prompt) return;
-    }
-    const files = useFolder ? (await pickFolder()) : (await pickFiles());
-    if (!files.length) { toast('未选择图片，已取消'); return; }
-    if (useFolder) {
-      const rel = files[0].webkitRelativePath || '';
-      const folder = rel.includes('/') ? rel.split('/')[0] : '';
-      log('📂 文件夹：' + (folder || '(未知)') + '，共 ' + files.length + ' 张图片');
-      if (files.length > 80) toast('提示：一次排队 ' + files.length + ' 张，如遇浏览器存储不足可分批处理', 6000);
-    }
-    toast('已加入队列：' + files.length + ' 张图片，开始自动处理…');
-    await startRun(files, prompt);
+    await runFlow(!!useFolder, '');
   }
 
   function showHelp() {
@@ -872,6 +951,11 @@
 
   function runDiag() {
     const lines = [];
+    let ver = '?';
+    try { ver = GM_info.script.version; } catch (e) {}
+    lines.push('脚本版本：' + ver + (ver === '?' ? '（无法读取，请检查是否用 Tampermonkey 安装）' : ''));
+    lines.push('文件夹选择方式：' + (typeof window.showDirectoryPicker === 'function' ? '原生 API ✅' : '上传控件（兜底）'));
+    lines.push('userActivation：' + (navigator.userActivation ? '支持' : '不支持（旧浏览器）'));
     const ed = getEditor();
     lines.push('输入框：' + (ed ? '✅ ' + describeEl(ed) : '❌ 未找到'));
     const cr = composerRoot();
