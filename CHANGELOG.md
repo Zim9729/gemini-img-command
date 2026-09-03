@@ -1,0 +1,22 @@
+# 更新日志 / Changelog
+
+本文件记录 gemini-img-command 的版本变更。
+
+格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
+版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
+
+## [1.0.0] - 2026-02-14
+
+### 新增
+
+- 首个正式版本。
+- `/img <提示词>` 命令：在 Gemini 输入框直接触发「选图 → 上传 → 发送 → 等待生成 → 按原图文件名下载」全流程。
+- `Alt+G` 快捷键与 Tampermonkey 菜单命令入口。
+- 多图排队处理，每张图自动新开对话（`/imgconf` 可关）。
+- 生成图严格按原文件名保存（`/imgname` 可切换为自动纠正扩展名）；一次多图时追加 `_2`、`_3` 后缀。
+- 队列持久化（localStorage + IndexedDB）：中途刷新或关闭页面后自动断点续跑。
+- 多标签页互斥锁（心跳保活），避免重复处理。
+- 右下角可拖动状态面板：实时进度 + 运行日志。
+- `/imgdiag` 诊断命令：检查输入框 / 发送按钮 / 上传入口 / 回复容器等关键元素，便于 Google 改版后排查。
+- 上传双通道：页面 file input 优先，失败自动降级为编辑器模拟粘贴。
+- 下载双通道：原生 fetch 优先，跨域受限时走 GM_xmlhttpRequest。
