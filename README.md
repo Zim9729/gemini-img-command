@@ -23,6 +23,10 @@
 
 ## 📦 安装
 
+提供两种安装方式，**功能完全相同**，任选其一：
+
+### 方式一：油猴脚本（需 Tampermonkey）
+
 1. 浏览器安装 [Tampermonkey](https://www.tampermonkey.net/)（篡改猴）扩展（Chrome / Edge 均可）
 2. Tampermonkey 图标 → 「添加新脚本」→ 删除默认内容 → 粘贴 `gemini-img-command.user.js` 的全部内容 → `Ctrl+S` 保存
    - 或者：把 `gemini-img-command.user.js` 文件直接拖入浏览器，在弹出的安装页点「安装」
@@ -30,6 +34,34 @@
 4. **在 Gemini 的模型选择器中选择支持图像生成的模型**（如「图像生成」/ Nano Banana / Gemini 2.5 Flash Image），并先手动确认你能在网页版生成图片
 
 > 更新脚本：Tampermonkey 管理面板 → 打开本脚本 → 全选替换为新版全文 → `Ctrl+S`。
+
+### 方式二：浏览器扩展（无需 Tampermonkey）
+
+将脚本打包为原生 Chrome/Edge 扩展，不依赖任何第三方扩展管理器：
+
+1. **构建扩展文件**（首次或每次更新脚本后运行）：
+   ```powershell
+   powershell -ExecutionPolicy Bypass -File build-extension.ps1
+   ```
+   这会从 `gemini-img-command.user.js` 生成 `extension/content.js` 并同步版本号到 `manifest.json`。
+   - 仓库已附带构建好的 `extension/` 目录，如果没改脚本可以跳过此步直接加载
+
+2. **加载扩展**：
+   - **Chrome**：地址栏输入 `chrome://extensions` → 右上角打开「开发者模式」→ 点「加载已解压的扩展程序」→ 选择项目下的 `extension` 文件夹
+   - **Edge**：地址栏输入 `edge://extensions` → 左侧打开「开发人员模式」→ 点「加载解压缩的扩展」→ 选择 `extension` 文件夹
+
+3. 打开 <https://gemini.google.com/> 并登录你的 Google 账号，右下角应出现 🖼 悬浮按钮
+
+> 更新扩展：重新运行 `build-extension.ps1` → 在扩展管理页点该扩展的「刷新」按钮 → 刷新 Gemini 页面。
+>
+> **两种方式的区别**：
+> | | 油猴脚本 | 浏览器扩展 |
+> |---|---|---|
+> | 依赖 Tampermonkey | 是 | 否 |
+> | 安装步骤 | 拖入浏览器即装 | 需开启开发者模式 + 加载文件夹 |
+> | 更新方式 | 粘贴替换 | 运行构建脚本 + 点刷新 |
+> | 配置/数据互通 | 共享 localStorage/IndexedDB | 独立存储（互不干扰） |
+> | 跨域图片下载 | GM_xmlhttpRequest | background service worker 代理 |
 
 ## 🚀 使用
 
@@ -85,7 +117,13 @@
 ```
 gemini-img-command/
 ├── README.md                      # 本文件
-├── gemini-img-command.user.js     # 油猴脚本（安装这个）
+├── gemini-img-command.user.js     # 油猴脚本（方式一安装这个）
+├── build-extension.ps1            # 构建脚本：从 .user.js 生成扩展的 content.js
+├── extension/                     # 浏览器扩展（方式二加载这个文件夹）
+│   ├── manifest.json              # 扩展清单（MV3）
+│   ├── background.js              # service worker：代理跨域图片下载
+│   ├── gm-shim.js                 # GM_* API 适配层
+│   └── content.js                 # 构建产物 = gm-shim.js + .user.js 正文
 ├── CHANGELOG.md                   # 更新日志
 └── LICENSE                        # MIT 许可证
 ```
