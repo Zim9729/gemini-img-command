@@ -7,7 +7,7 @@
 const GM_setValue = (k, v) => { try { localStorage.setItem('gic-gm:' + k, String(v)); } catch (e) {} };
 const GM_getValue  = (k, d) => { try { const v = localStorage.getItem('gic-gm:' + k); return v === null ? d : v; } catch (e) { return d; } };
 const GM_registerMenuCommand = function () {};
-const GM_info = { script: { version: '2.1.3', name: 'Gemini 批量图片生成面板' } };
+const GM_info = { script: { version: '2.1.4', name: 'Gemini 批量图片生成面板' } };
 const GM_xmlhttpRequest = (opts) => {
   chrome.runtime.sendMessage(
     { type: 'gmxhr', opts: { method: opts.method || 'GET', url: opts.url } },
@@ -46,7 +46,7 @@ const GM_xmlhttpRequest = (opts) => {
   'use strict';
 
   /* ---- 版本标识与加载横幅（F12 控制台过滤 gic 即可确认脚本是否在运行） ---- */
-  const SCRIPT_VERSION = '2.1.3';
+  const SCRIPT_VERSION = '2.1.4';
   try {
     console.log('%c[gic] Gemini 批量图片生成面板 v' + SCRIPT_VERSION + ' 已加载',
       'color:#8ab4f8;font-weight:bold');
@@ -456,8 +456,25 @@ const GM_xmlhttpRequest = (opts) => {
     } catch (e) { return false; }
   }
 
+  // 模拟拖放文件到编辑器（paste 不生效时的备选途径）
+  function uploadViaDrop(file) {
+    const ed = getEditor();
+    if (!ed) return false;
+    try {
+      ed.focus();
+      const dt = new DataTransfer();
+      dt.items.add(file);
+      const opts = { bubbles: true, cancelable: true, dataTransfer: dt };
+      // dragenter / dragover 是 drop 的前置事件，很多页面的 drop handler 依赖它们
+      ed.dispatchEvent(new DragEvent('dragenter', opts));
+      ed.dispatchEvent(new DragEvent('dragover', opts));
+      ed.dispatchEvent(new DragEvent('drop', opts));
+      return true;
+    } catch (e) { return false; }
+  }
+
   // 附件预览：Gemini 的本地预览图是 blob:/data: 地址（生成图是 https://lh3…，不会混淆）
-  const PREVIEW_SEL = 'uploader-file-preview, uploader-file-preview-container, [data-test-id*="file-preview"], [data-test-id*="uploaded"], .file-preview, img[src^="blob:"], img[src^="data:image"]';
+  const PREVIEW_SEL = 'uploader-file-preview, uploader-file-preview-container, [data-test-id*="file-preview"], [data-test-id*="uploaded"], [data-testid*="file-preview"], [data-testid*="uploaded"], [data-testid*="attachment"], .file-preview, .attachment-preview, .file-chip, .upload-preview, img[src^="blob:"], img[src^="data:image"]';
   const inResponseArea = (el) => !!el.closest(RESP_SELS + ', user-query, .query-content');
 
   async function uploadSettle() {
@@ -468,13 +485,24 @@ const GM_xmlhttpRequest = (opts) => {
   }
 
   async function uploadFile(file) {
-    const nameKey = (file.name.replace(/\.[^.]+$/, '') || file.name).slice(0, 8);
-    const before = new Set(document.querySelectorAll(PREVIEW_SEL));
+    const nameKey = (file.name.replace(/\.[^.]+$/, '') || file.name).slice(0, 20);
+    // before 集合需包含 composerRoot 内的 img 元素，以便检测改版后新增的预览图
+    const cr = composerRoot();
+    const before = new Set([
+      ...document.querySelectorAll(PREVIEW_SEL),
+      ...((cr ? [...cr.querySelectorAll('img')] : []))
+    ]);
     const attached = () => {
       const r = composerRoot();
       if (r && (r.textContent || '').includes(nameKey)) return true;                 // 出现文件名 chip
-      return [...document.querySelectorAll(PREVIEW_SEL)]                              // 或出现新的预览元素
-        .some((el) => !before.has(el) && isVisible(el) && !inResponseArea(el) && !panelEl?.contains(el));
+      if ([...document.querySelectorAll(PREVIEW_SEL)]                              // 或出现新的预览元素
+        .some((el) => !before.has(el) && isVisible(el) && !inResponseArea(el) && !panelEl?.contains(el))) return true;
+      // 兜底：检测 composerRoot 内新增的 img 元素（Gemini 改版后预览图 src 格式可能变化）
+      if (r) {
+        const imgs = [...r.querySelectorAll('img')];
+        if (imgs.some((img) => !before.has(img) && isVisible(img) && !panelEl?.contains(img))) return true;
+      }
+      return false;
     };
 
     // 途径 1：向编辑器模拟「粘贴」（Gemini 会接管 paste 事件并附加文件）
@@ -484,7 +512,14 @@ const GM_xmlhttpRequest = (opts) => {
       return;
     }
 
-    // 途径 2：页面上已存在的 file input（优先 accept 含 image 的）
+    // 途径 2：模拟拖放（paste 不生效时的备选，Gemini 也处理 drop 事件）
+    if (uploadViaDrop(file) && await waitFor(attached, 12000, 500)) {
+      await uploadSettle();
+      log('  ⬆ 已附加（拖放方式）：' + file.name);
+      return;
+    }
+
+    // 途径 3：页面上已存在的 file input（优先 accept 含 image 的）
     const inputs = [...document.querySelectorAll('input[type="file"]')]
       .sort((a, b) => ((b.accept || '').includes('image') ? 1 : 0) - ((a.accept || '').includes('image') ? 1 : 0))
       .slice(0, 3);
@@ -502,7 +537,7 @@ const GM_xmlhttpRequest = (opts) => {
       }
     }
 
-    throw new Error('无法把图片放入输入框（粘贴与 file input 均未检测到附件预览，请点「诊断」反馈）');
+    throw new Error('无法把图片放入输入框（粘贴/拖放/file input 均未检测到附件预览，请点「诊断」反馈）');
   }
 
   async function sendAndWait() {
