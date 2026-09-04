@@ -7,7 +7,7 @@
 const GM_setValue = (k, v) => { try { localStorage.setItem('gic-gm:' + k, String(v)); } catch (e) {} };
 const GM_getValue  = (k, d) => { try { const v = localStorage.getItem('gic-gm:' + k); return v === null ? d : v; } catch (e) { return d; } };
 const GM_registerMenuCommand = function () {};
-const GM_info = { script: { version: '2.3.2', name: 'Gemini 批量图片生成面板' } };
+const GM_info = { script: { version: '2.3.3', name: 'Gemini 批量图片生成面板' } };
 const GM_xmlhttpRequest = (opts) => {
   // 超时契约与用户脚本 v2.3.2 对齐：background 无响应（fetch 挂起/worker 消失）时
   // 触发 ontimeout，防止队列永久卡死（用户脚本对 GM_xhr 传 timeout: 60000）
@@ -64,7 +64,7 @@ const GM_xmlhttpRequest = (opts) => {
   /* ---- 版本标识与加载横幅（F12 控制台过滤 gic 即可确认脚本是否在运行） ---- */
   // 版本以 @version 为准：运行时读 GM_info（Tampermonkey 始终同步提供），字面量仅作无沙箱兜底，
   // 消除两处手工双写漂移的可能
-  let SCRIPT_VERSION = '2.3.2';
+  let SCRIPT_VERSION = '2.3.3';
   try {
     if (typeof GM_info !== 'undefined' && GM_info && GM_info.script && GM_info.script.version) {
       SCRIPT_VERSION = GM_info.script.version;

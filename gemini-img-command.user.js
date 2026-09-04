@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Gemini 批量图片生成面板
 // @namespace    gemini-img-command
-// @version      2.3.2
+// @version      2.3.3
 // @description  gemini.google.com 批量图片生成配置面板：提前选好文件夹 + 填好提示词，点击「执行」自动循环每一张图（每图独立新对话）→ 等待生成 → 按原图文件名下载，直至全部完成。
 // @author       gemini-img-command
 // @match        https://gemini.google.com/*
@@ -44,7 +44,7 @@
   /* ---- 版本标识与加载横幅（F12 控制台过滤 gic 即可确认脚本是否在运行） ---- */
   // 版本以 @version 为准：运行时读 GM_info（Tampermonkey 始终同步提供），字面量仅作无沙箱兜底，
   // 消除两处手工双写漂移的可能
-  let SCRIPT_VERSION = '2.3.2';
+  let SCRIPT_VERSION = '2.3.3';
   try {
     if (typeof GM_info !== 'undefined' && GM_info && GM_info.script && GM_info.script.version) {
       SCRIPT_VERSION = GM_info.script.version;

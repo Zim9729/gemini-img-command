@@ -39,3 +39,12 @@ $manifest = [System.IO.File]::ReadAllText($manifestPath, $utf8)
 $manifest = [System.Text.RegularExpressions.Regex]::Replace($manifest, '"version":\s*"[^"]*"', "`"version`": `"$ver`"")
 [System.IO.File]::WriteAllText($manifestPath, $manifest, $utf8)
 Write-Host "manifest.json synced (v$ver)" -ForegroundColor Green
+
+# 同步描述到 manifest.json（与 @description 保持一致，防止两处文案各自漂移）
+$descMatch = [System.Text.RegularExpressions.Regex]::Match($userJs, '// @description\s+(.+)')
+if ($descMatch.Success) {
+  $desc = $descMatch.Groups[1].Value.Trim().Replace('\', '\\').Replace('"', '\"')
+  $manifest = [System.Text.RegularExpressions.Regex]::Replace($manifest, '"description":\s*"[^"]*"', "`"description`": `"$desc`"")
+  [System.IO.File]::WriteAllText($manifestPath, $manifest, $utf8)
+  Write-Host "manifest.json description synced" -ForegroundColor Green
+}

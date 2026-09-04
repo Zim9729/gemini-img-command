@@ -5,6 +5,14 @@
 格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [2.3.3] - 2026-09-04
+
+### 变更（扩展元数据与用户脚本对齐）
+
+- **manifest 权限与 `@connect` 完全对齐**：`host_permissions` 此前只有 `https://*.域名/*`（仅子域），而 `@connect 域名` 允许裸域 + 子域。补齐 4 个裸域模式（google.com / googleusercontent.com / gstatic.com / googleapis.com），消除扩展版比油猴版少覆盖裸域的语义差异（生成图实际都在子域上，属纯对齐，无功能影响）。
+- **manifest 描述与 `@description` 同步**：扩展描述此前是旧版文案；现在 `build-extension.ps1` 构建时自动从用户脚本头同步描述，连同版本号一道杜绝两处漂移。
+- 用户脚本逻辑零改动（仅版本号字面量）。
+
 ## [2.3.2] - 2026-09-04
 
 ### 修复（代码审查）
