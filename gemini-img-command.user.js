@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Gemini 批量图片生成面板
 // @namespace    gemini-img-command
-// @version      2.1.5
+// @version      2.1.6
 // @description  gemini.google.com 批量图片生成配置面板：提前选好文件夹 + 填好提示词，点击「执行」自动循环每一张图（每图独立新对话）→ 等待生成 → 按原图文件名下载，直至全部完成。
 // @author       gemini-img-command
 // @match        https://gemini.google.com/*
@@ -38,7 +38,7 @@
   'use strict';
 
   /* ---- 版本标识与加载横幅（F12 控制台过滤 gic 即可确认脚本是否在运行） ---- */
-  const SCRIPT_VERSION = '2.1.5';
+  const SCRIPT_VERSION = '2.1.6';
   try {
     console.log('%c[gic] Gemini 批量图片生成面板 v' + SCRIPT_VERSION + ' 已加载',
       'color:#8ab4f8;font-weight:bold');
@@ -546,10 +546,10 @@
     if (!r) return false;
     // 条件 1：文件名 chip 出现在输入区
     if ((r.textContent || '').includes(nameKey)) return true;
-    // 条件 2：PREVIEW_SEL 元素存在于输入区附近
-    if ([...document.querySelectorAll(PREVIEW_SEL)].some((el) => isVisible(el) && !inResponseArea(el) && !panelEl?.contains(el))) return true;
+    // 条件 2：PREVIEW_SEL 元素存在于 composerRoot 内（限定范围，避免匹配到回复区的残留）
+    if ([...r.querySelectorAll(PREVIEW_SEL)].some((el) => isVisible(el) && !panelEl?.contains(el))) return true;
     // 条件 3：composerRoot 内有 ≥ 50px 的预览图
-    if ([...r.querySelectorAll('img')].some((img) => img.naturalWidth >= 50 && img.naturalHeight >= 50 && isVisible(img))) return true;
+    if ([...r.querySelectorAll('img')].some((img) => img.naturalWidth >= 50 && img.naturalHeight >= 50 && isVisible(img) && !panelEl?.contains(img))) return true;
     return false;
   }
 
@@ -1179,6 +1179,12 @@
     if (q && !q.done && q.stopped) {
       const hasPending = q.statuses.some((s) => s === 'pending');
       if (hasPending) {
+        // 防竞态：上一个 processQueue 可能尚未退出（localRunning 仍为 true），
+        // 此时调用 processQueue 会被 guard 拦住直接返回，导致队列卡死
+        if (localRunning) {
+          toast('队列正在停止中，请稍候再点「继续」');
+          return;
+        }
         q.stopped = false;
         metaSave(q);
         log('▶ 继续执行队列（从第 ' + (q.idx + 1) + ' 张开始）');
