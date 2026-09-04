@@ -5,6 +5,20 @@
 格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [2.3.2] - 2026-09-04
+
+### 修复（代码审查）
+
+- **下载无超时可致队列永久卡死**：`gmFetchBlob` 的 `GM_xmlhttpRequest` 未设超时，连接挂起（stalled 但未断开）时 Promise 永不 settle——此时已越过所有等待守护、心跳照常、锁一直持有，队列零进展。补 `timeout: 60 秒` + `ontimeout`，按单张失败进入正常记错流程；扩展版同步补齐（gm-shim 转发超时并在 background 无响应时触发 `ontimeout`，background fetch 加 `AbortSignal.timeout` 中止）。
+- **跨标签页停止在生成等待期间不生效**：其他标签页写入的 `stopped` 此前要等当前张超时（默认 5 分钟）后才在循环顶部被发现。`sendAndWait` 全程轮询存储（1 秒粒度），停止/替换队列即时以 `stoppedByOther` 中断当前张、回退 `pending` 不记错误；限额等待同样补上 `stopped` 检查（原先只看队列替换，跨标签页停止要白等满 30 分钟～24 小时）。
+- **文件名 chip 子串碰撞**：`includes(nameKey)` 会把残留 chip「sunset-2024-v2.jpg」误判为当前文件「sunset-2024」的附件。三处匹配（`attached` / `chipAttached` / `verifyAttachment`）统一改为整体匹配（前后非文件名字符），并放行 chip 截断显示（nameKey + 省略号）。
+- **长对话虚拟滚动误报**：同对话续跑且对话很长时，旧回复被移出 DOM 使位置水位失真，导致误报「回复中没有生成图片」。水位失真时退化为纯身份比对（快照集合）；完成签名（页面稳定 4 秒判定）只统计本次新增回复；started 判定兼用身份比对。
+- **严格原名模式下 `.bmp` 名实不符无提示**：canvas 无法编码 bmp，`convertBlob` 原样返回导致 PNG/WebP 数据存进 `.bmp` 且无任何提示（GIF 分支有提示）。现与 GIF 一致明确 ⚠ 日志。
+- **`processQueue` 无顶层 catch**：per-item try 之外的异常以未处理 rejection 逃逸（所有调用点均 fire-and-forget），表现为无声停止。补顶层 catch 记日志 + toast，当前张保持 pending 由刷新续跑重试。
+- **旧版对象形式 cfg 静默重置**：`safeParse` 放行对象值（`GM_getValue` 支持结构化克隆，旧版直接存对象时 `JSON.parse(对象)` 抛错回退 `{}` 丢配置）。
+- **`fileSweep` 删不掉非数字键**：按原始键删除 `file:*` 残留（原实现 parseInt 得 NaN 后拼出 `file:NaN` 删空），顺带清理非规范数字键。
+- **若干小项**：`SCRIPT_VERSION` 运行时取 `GM_info.script.version`（消除与 `@version` 双写漂移，诊断面板死分支一并移除）；多条 toast 依次向下堆叠不互相遮盖；面板拖动位置持久化（页面移除重建/刷新后恢复，钳制在视口内）。
+
 ## [2.3.0] - 2026-09-04
 
 ### 新增

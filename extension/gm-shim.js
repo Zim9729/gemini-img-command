@@ -7,11 +7,23 @@
 const GM_setValue = (k, v) => { try { localStorage.setItem('gic-gm:' + k, String(v)); } catch (e) {} };
 const GM_getValue  = (k, d) => { try { const v = localStorage.getItem('gic-gm:' + k); return v === null ? d : v; } catch (e) { return d; } };
 const GM_registerMenuCommand = function () {};
-const GM_info = { script: { version: '2.3.0', name: 'Gemini 批量图片生成面板' } };
+const GM_info = { script: { version: '2.3.2', name: 'Gemini 批量图片生成面板' } };
 const GM_xmlhttpRequest = (opts) => {
+  // 超时契约与用户脚本 v2.3.2 对齐：background 无响应（fetch 挂起/worker 消失）时
+  // 触发 ontimeout，防止队列永久卡死（用户脚本对 GM_xhr 传 timeout: 60000）
+  const tmo = (typeof opts.timeout === 'number' && opts.timeout > 0) ? opts.timeout : 60000;
+  let settled = false;
+  const tid = setTimeout(() => {
+    if (settled) return;
+    settled = true;
+    if (opts.ontimeout) opts.ontimeout();
+  }, tmo);
   chrome.runtime.sendMessage(
-    { type: 'gmxhr', opts: { method: opts.method || 'GET', url: opts.url } },
+    { type: 'gmxhr', opts: { method: opts.method || 'GET', url: opts.url, timeout: tmo } },
     (resp) => {
+      clearTimeout(tid);
+      if (settled) return; // 超时已触发，丢弃迟到的响应
+      settled = true;
       if (chrome.runtime.lastError || !resp) {
         if (opts.onerror) opts.onerror(new Error((chrome.runtime.lastError && chrome.runtime.lastError.message) || 'background 无响应'));
         return;

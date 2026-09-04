@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Gemini 批量图片生成面板
 // @namespace    gemini-img-command
-// @version      2.3.0
+// @version      2.3.2
 // @description  gemini.google.com 批量图片生成配置面板：提前选好文件夹 + 填好提示词，点击「执行」自动循环每一张图（每图独立新对话）→ 等待生成 → 按原图文件名下载，直至全部完成。
 // @author       gemini-img-command
 // @match        https://gemini.google.com/*
@@ -42,7 +42,14 @@
   'use strict';
 
   /* ---- 版本标识与加载横幅（F12 控制台过滤 gic 即可确认脚本是否在运行） ---- */
-  const SCRIPT_VERSION = '2.3.0';
+  // 版本以 @version 为准：运行时读 GM_info（Tampermonkey 始终同步提供），字面量仅作无沙箱兜底，
+  // 消除两处手工双写漂移的可能
+  let SCRIPT_VERSION = '2.3.2';
+  try {
+    if (typeof GM_info !== 'undefined' && GM_info && GM_info.script && GM_info.script.version) {
+      SCRIPT_VERSION = GM_info.script.version;
+    }
+  } catch (e) {}
   try {
     console.log('%c[gic] Gemini 批量图片生成面板 v' + SCRIPT_VERSION + ' 已加载',
       'color:#8ab4f8;font-weight:bold');
@@ -64,6 +71,9 @@
   };
 
   function safeParse(s) {
+    // GM_getValue 可能取出旧版直接存的对象（GM_setValue 支持结构化克隆值）：
+    // JSON.parse(对象) 会抛错回退 {}，导致配置静默重置——对象直接放行
+    if (s && typeof s === 'object') return s;
     try { return JSON.parse(s) || {}; } catch (e) { return {}; }
   }
   // GM_* 不可用（如 Greasemonkey 4 只提供异步 GM.*）时回退到 localStorage，避免脚本在此处直接中止
@@ -107,6 +117,15 @@
     });
   }
 
+  /* ---- toast：多条依次向下堆叠，避免同时弹出时互相遮盖 ---- */
+  const activeToasts = [];
+  function layoutToasts() {
+    let top = 18;
+    for (const t of activeToasts) {
+      t.style.top = top + 'px';
+      top += (t.offsetHeight || 44) + 8;
+    }
+  }
   function toast(msg, ms) {
     try {
       const host = document.body || document.documentElement;
@@ -120,10 +139,18 @@
         'max-width:80vw', 'word-break:break-all'
       ].join(';');
       host.appendChild(d);
+      activeToasts.push(d);
+      layoutToasts();
       setTimeout(() => {
         d.style.transition = 'opacity .4s';
         d.style.opacity = '0';
-        setTimeout(() => d.remove(), 450);
+        // 淡出期间保留占位（不与后续 toast 重叠），移除后再收拢其余 toast
+        setTimeout(() => {
+          const i = activeToasts.indexOf(d);
+          if (i >= 0) activeToasts.splice(i, 1);
+          d.remove();
+          layoutToasts();
+        }, 450);
       }, ms || 3500);
     } catch (e) { /* 忽略 */ }
   }
@@ -202,8 +229,11 @@
       if (!Array.isArray(keys)) return;
       for (const k of keys) {
         if (typeof k === 'string' && k.indexOf('file:') === 0) {
-          const i = parseInt(k.slice(5), 10);
-          if (!(i >= 0 && i < keepCount)) await fileDel(i);
+          // 按原始键删除：非数字后缀（如 file:abc）parseInt 得 NaN，
+          // 旧实现拼出 file:NaN 删不到真正的键，残留会永久占着存储
+          const n = parseInt(k.slice(5), 10);
+          const keep = Number.isInteger(n) && n >= 0 && n < keepCount && String(n) === k.slice(5);
+          if (!keep) await idbOp(k, 'readwrite', (s) => s.delete(k)).catch(() => {});
         }
       }
     } catch (e) { /* 清理失败不阻塞新任务 */ }
@@ -396,9 +426,14 @@
       });
     });
     const list = [...document.querySelectorAll(RESP_SELS)];
-    for (let i = list.length - 1; i >= skipCount; i--) {
+    // 长对话虚拟滚动会移除旧回复节点，使 list.length < skipCount（位置水位失真）→
+    // 退化为纯身份比对（只扫不在快照集合里的回复）；水位仍有效时两种判断并用
+    // （身份防删减/移位，水位防旧节点被框架原地重建后漏判）
+    const positionalOk = list.length >= skipCount;
+    for (let i = list.length - 1; i >= 0; i--) {
       const c = list[i];
       if (skipEls && skipEls.has(c)) continue;
+      if (positionalOk && i < skipCount) continue;
       if (c.closest('user-query, .query-content, [data-test-id*="query"]')) continue;
       let imgs = [...c.querySelectorAll('img')].filter(isGeneratedImg);
       if (userSrcs.size) imgs = imgs.filter((im) => !userSrcs.has(im.currentSrc || im.src || ''));
@@ -418,9 +453,12 @@
 
   function quotaDetected(skipCount, skipEls) {
     const list = [...document.querySelectorAll(RESP_SELS)];
-    for (let i = list.length - 1; i >= (skipCount || 0); i--) {
+    // 与 collectResponseImages 相同的虚拟滚动容错：水位失真时退化为纯身份比对
+    const positionalOk = list.length >= (skipCount || 0);
+    for (let i = list.length - 1; i >= 0; i--) {
       const c = list[i];
       if (skipEls && skipEls.has(c)) continue;
+      if (positionalOk && i < (skipCount || 0)) continue;
       const t = (c.textContent || '').trim();
       if (t && QUOTA_PATTERNS.some((p) => p.test(t))) return t;
     }
@@ -523,6 +561,25 @@
   }
 
   const normWs = (s) => String(s || '').replace(/\s+/g, ' ').trim();
+
+  // 文件名整体匹配：在一段文本里找「独立的」文件名，防止前缀碰撞——
+  // 残留 chip「sunset-2024-v2.jpg」会让 includes(nameKey) 误匹配当前 nameKey「sunset-2024」。
+  // 「整体」= 前后都不是文件名字符（字母/数字/_/-）；长文件名被 chip 截断显示（nameKey + 省略号）也放行
+  function textHasWholeName(text, fullName, nameKey) {
+    const t = String(text || '');
+    if (!t) return false;
+    const whole = (name) => {
+      if (!name) return false;
+      const esc = String(name).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+      try {
+        return new RegExp('(^|[^A-Za-z0-9_\\-])' + esc + '(?=$|[^A-Za-z0-9_\\-])').test(t);
+      } catch (e) { return t.indexOf(name) >= 0; }
+    };
+    if (whole(fullName)) return true;
+    if (whole(nameKey)) return true;
+    if (nameKey && (t.indexOf(nameKey + '…') >= 0 || t.indexOf(nameKey + '...') >= 0)) return true;
+    return false;
+  }
 
   function editorHasText(text) {
     const ed = getEditor();
@@ -643,7 +700,7 @@
     };
     const attached = () => {
       const r = composerRoot();
-      if (r && (r.textContent || '').includes(nameKey)) return true;                 // 出现文件名 chip
+      if (r && textHasWholeName(r.textContent, file.name, nameKey)) return true;                 // 出现文件名 chip
       if ([...document.querySelectorAll(PREVIEW_SEL)]                              // 或出现新的预览元素
         .some((el) => !before.has(el) && isVisible(el) && !inResponseArea(el) && !panelEl?.contains(el))) return true;
       // 兜底：检测 composerRoot 内新增的、尺寸足够大的 img 元素（排除小图标）
@@ -659,7 +716,7 @@
       const r = composerRoot();
       if (!r) return false;
       const t = r.textContent || '';
-      return t.includes(file.name) || t.includes(nameKey);
+      return textHasWholeName(t, file.name, nameKey);
     };
 
     // 上传途径按「上次成功者优先」排序（记忆存 cfg.uploadPath）：
@@ -725,9 +782,9 @@
     const r = composerRoot();
     if (!r) return false;
     const t = r.textContent || '';
-    // 条件 1：文件名 chip 出现在输入区。优先完整文件名（含扩展名），
+    // 条件 1：文件名 chip 出现在输入区（整体匹配）。优先完整文件名（含扩展名），
     // 防「sunset.jpg」的 nameKey「sunset」误匹配残留 chip「sunset-2.jpg」
-    if ((fullName && t.includes(fullName)) || t.includes(nameKey)) return true;
+    if (textHasWholeName(t, fullName, nameKey)) return true;
     const isNew = (el) => !lastUploadBefore.has(el);
     // 条件 2：PREVIEW_SEL 元素存在于 composerRoot 内（限定范围，避免匹配到回复区的残留）
     if ([...r.querySelectorAll(PREVIEW_SEL)].some((el) => isNew(el) && isVisible(el) && !panelEl?.contains(el))) return true;
@@ -736,7 +793,7 @@
     return false;
   }
 
-  async function sendAndWait() {
+  async function sendAndWait(qid) {
     const btn = await waitFor(findSendButton, 20000, 400);
     if (!btn) throw new Error('找不到发送按钮');
     // 紧贴点击前一刻快照已存在的回复：后续只把「点发送之后新增」的回复当作本次结果，
@@ -747,9 +804,26 @@
     btn.click();
     log('  ✉ 已发送，等待生成…');
 
+    // 跨标签页停止/队列替换检测：本标签页停止走 cancelRequested（waitFor 秒级返回），
+    // 其他标签页只写 meta.stopped 或换队列 id，这里轮询识别后以 stoppedByOther 中断当前张，
+    // 不必等满单张超时（默认 5 分钟）才在循环顶部退出
+    const queueGone = () => {
+      const cur = metaLoad();
+      return !!(cur && (cur.stopped || (qid && cur.id !== qid)));
+    };
+    const STOP_MARK = { __gicStop: true };
+    const stopErr = () => {
+      const err = new Error('检测到队列已被停止或替换（其他标签页）');
+      err.stoppedByOther = true;
+      return err;
+    };
+    // started 判定兼用身份比对：长对话虚拟滚动下「一旧换一新」总数不变，
+    // 仅靠 countResponses() > prevCount 会漏判已开始生成
     const started = await waitFor(() =>
-      countResponses() > prevCount || !!findStopButton() || !findSendButton()
+      [...document.querySelectorAll(RESP_SELS)].some((el) => !prevEls.has(el))
+      || !!findStopButton() || !findSendButton()
     , 60000, 700);
+    if (queueGone()) throw stopErr();
     if (!started) throw new Error('发送后未检测到新回复');
 
     await sleep(3000); // 等待界面切换到「生成中」状态，避免误判
@@ -758,20 +832,24 @@
     // 不出现时过早判完，把仍在生成（>30 秒）的回复误报为「没有生成图片」
     let sig = '', sigAt = 0;
     const pageSig = () => {
-      const list = document.querySelectorAll(RESP_SELS);
+      // 签名只统计「本次发送后新增」的回复：虚拟滚动移除旧节点会改变总数，
+      // 把旧节点计入会让「页面稳定 4 秒」判定反复归零，最终误报等待超时
+      const list = [...document.querySelectorAll(RESP_SELS)].filter((c) => !prevEls.has(c));
       const last = list[list.length - 1];
-      const imgSrcs = [...list].slice(-3)
+      const imgSrcs = list.slice(-3)
         .flatMap((c) => [...c.querySelectorAll('img')].map((im) => im.currentSrc || im.src || ''))
         .join('|');
       return list.length + '|' + (last ? (last.textContent || '').length : 0) + '|' + imgSrcs;
     };
     const done = await waitFor(() => {
+      if (queueGone()) return STOP_MARK;
       if (!findSendButton() || findStopButton()) { sig = ''; sigAt = 0; return false; }
       const s = pageSig();
       if (s !== sig) { sig = s; sigAt = Date.now(); return false; }
       if (!sigAt) { sigAt = Date.now(); return false; }
       return Date.now() - sigAt >= 4000;
     }, cfg.waitTimeoutMs, 1000);
+    if (done === STOP_MARK) throw stopErr();
     if (!done) throw new Error('等待生成超时');
 
     await sleep(2500); // 图片渲染稳定
@@ -779,11 +857,13 @@
     if (!imgs.length) {
       // 等图的同时监测限额文字（纯文字回复会很快出现，命中即提前结束等待，不用耗满窗口）
       const got = await waitFor(() => {
+        if (queueGone()) return STOP_MARK;
         const qt = quotaDetected(prevCount, prevEls);
         if (qt) return { quotaText: qt };
         const v = collectResponseImages(prevCount, prevEls);
         return v.length ? v : null;
       }, 30000, 1500);
+      if (got === STOP_MARK) throw stopErr();
       if (got && got.quotaText) {
         // 带标记的异常：processQueue 识别后不记错误，而是等待额度恢复自动重试
         const err = new Error('检测到用量限额：' + normWs(got.quotaText).slice(0, 60));
@@ -822,8 +902,12 @@
         method: 'GET',
         url: url,
         responseType: 'blob',
+        // 无超时的话，连接挂起（stalled 但未断开）时 Promise 永不 settle：
+        // 此时已越过 sendAndWait 的守护、没有任何 waitFor 兜底，队列会永久卡死（心跳照常、锁一直持有）
+        timeout: 60000,
         onload: (r) => (r.status >= 200 && r.status < 300) ? resolve(r.response) : reject(new Error('HTTP ' + r.status)),
-        onerror: () => reject(new Error('网络或跨域受限'))
+        onerror: () => reject(new Error('网络或跨域受限')),
+        ontimeout: () => reject(new Error('下载超时（60 秒）'))
       });
     });
   }
@@ -896,6 +980,10 @@
           // 严格模式保留原文件名，但明确提示 .jpg/.png 里装的是 GIF 数据
           if (!cfg.exactName) useExt = 'gif';
           else log('  ⚠ 数据为 GIF（转码会丢动画），严格原名模式下未转码，.' + p.ext + ' 内为 GIF 数据');
+        } else if (cfg.exactName && !MIME_BY_EXT[p.ext]) {
+          // 严格原名模式下目标是 canvas 无法编码的格式（如 .bmp 原图）：convertBlob 会原样返回，
+          // 数据与扩展名名实不符。明确提示而不是静默存错（非严格模式走下方 else，扩展名跟随实际数据）
+          log('  ⚠ 无法转码为 ' + p.ext.toUpperCase() + '（浏览器 canvas 不支持编码该格式），按原始 ' + realExt.toUpperCase() + ' 数据保存为 .' + p.ext);
         } else if (cfg.exactName) {
           // 严格原文件名：把数据转成扩展名对应的格式，而不是把 PNG 数据存成 .jpg
           try { blob = await convertBlob(blob, p.ext); log('  🔁 已将 ' + realExt.toUpperCase() + ' 转为 ' + p.ext.toUpperCase()); }
@@ -950,7 +1038,7 @@
     processQueue();
   }
 
-  async function processOne(i, prompt, name) {
+  async function processOne(i, prompt, name, qid) {
     const file = await fileGet(i);
     if (!file) throw new Error('文件数据丢失，请重新发起任务');
     await clearEditor();
@@ -961,7 +1049,7 @@
       throw new Error('附件校验失败：图片未真正附加到输入框（请点「诊断」反馈）');
     }
     await setPrompt(prompt);
-    const imgs = await sendAndWait();
+    const imgs = await sendAndWait(qid);
     await downloadImages(imgs, name);
   }
 
@@ -1001,13 +1089,14 @@
             // 新对话切换后编辑器会重建，等它就绪
             if (!(await waitFor(() => !!getEditor() && !!composerRoot(), 15000, 500))) throw new Error('新对话页面输入框未就绪');
           }
-          await processOne(i, m.prompt, m.names[i]);
+          await processOne(i, m.prompt, m.names[i], qid);
           m.statuses[i] = 'ok';
           panelSetState(m, i, 'ok');
           log('✅ ' + m.names[i]);
         } catch (e) {
-          // 被用户停止时，当前图片回退为 pending（不标记为错误），以便续跑
-          if (cancelRequested) {
+          // 被用户停止时（本标签页 cancelRequested，或其他标签页停止/替换队列触发的
+          // stoppedByOther 中断），当前图片回退为 pending（不标记为错误），以便续跑
+          if (cancelRequested || (e && e.stoppedByOther)) {
             m.statuses[i] = 'pending';
             const cur2 = metaLoad();
             if (!cur2 || cur2.id === qid) {
@@ -1048,11 +1137,13 @@
               + '（预计 ' + new Date(Date.now() + waitMs).toLocaleTimeString('zh-CN', { hour12: false })
               + '，点「停止」可中断）');
             toast('用量限额：' + fmtDur(waitMs) + '后自动重试', 6000);
-            // 等待期间心跳/锁保持；「停止/重置」会置 cancelRequested 使本等待提前结束；
-            // 其他标签页重置/替换队列（meta 换 id）时也在此提前结束，下一轮循环顶部的检查会立即退出
+            // 等待期间心跳/锁保持；本标签页「停止/重置」会置 cancelRequested 使本等待提前结束；
+            // 其他标签页的「停止」（meta 里 stopped=true，id 不变）或「重置/替换」（meta 换 id）也在此
+            // 提前结束（原实现只看 id，跨标签页停止要白等满整个 waitMs，最长 24 小时），
+            // 下一轮循环顶部的检查会立即退出
             await waitFor(() => {
               const cur = metaLoad();
-              return !!(cur && cur.id !== qid);
+              return !!(cur && (cur.id !== qid || cur.stopped));
             }, waitMs, 5000);
             i--; // 抵消 for 的 i++，重试当前张
             continue;
@@ -1086,6 +1177,13 @@
       metaSave(m);
       log('🎉 队列完成：成功 ' + okN + '，失败 ' + errN);
       toast('全部处理完成：成功 ' + okN + '，失败 ' + errN, 5000);
+    } catch (e) {
+      // 顶层兜底：per-item try 覆盖不到的异常（如 renderList/panelShow 的 DOM 错误）。
+      // processQueue 的调用点（startRun/executeClick/boot/finally 交接）全部 fire-and-forget 不 await，
+      // 没有它的话异常以未处理 rejection 逃逸，UI 表现为「无声停止」且无任何日志。
+      // 当前项在磁盘上仍是 pending（busy 只写内存），刷新后 boot 的自动续跑会重试该张
+      try { log('❌ 队列异常终止：' + ((e && e.message) || e)); } catch (_) {}
+      try { toast('队列异常终止：' + ((e && e.message) || e), 6000); } catch (_) {}
     } finally {
       if (hb) clearInterval(hb);
       localRunning = false;
@@ -1360,6 +1458,17 @@
       'box-shadow:0 6px 24px rgba(0,0,0,.45)', 'overflow:hidden'
     ].join(';');
 
+    // 恢复上次拖动位置（面板被页面移除重建、或刷新后不再跳回默认位置；钳制在视口内防止移到屏幕外）
+    try {
+      const pos = JSON.parse(localStorage.getItem('gic-panel-pos') || 'null');
+      if (pos && typeof pos.left === 'number' && typeof pos.top === 'number') {
+        panelEl.style.left = Math.max(0, Math.min(pos.left, Math.max(0, window.innerWidth - 120))) + 'px';
+        panelEl.style.top = Math.max(0, Math.min(pos.top, Math.max(0, window.innerHeight - 80))) + 'px';
+        panelEl.style.right = 'auto';
+        panelEl.style.bottom = 'auto';
+      }
+    } catch (e) { /* 位置恢复失败不影响功能 */ }
+
     /* ---- 标题栏（可拖动） ---- */
     const head = document.createElement('div');
     head.style.cssText = 'display:flex;align-items:center;gap:8px;padding:9px 12px;background:#2a2b2f;cursor:move;user-select:none;font-weight:600;font-size:13px';
@@ -1498,6 +1607,8 @@
       const onUp = () => {
         window.removeEventListener('mousemove', onMove);
         window.removeEventListener('mouseup', onUp);
+        // 持久化拖动位置，页面移除重建面板/刷新后可恢复
+        try { localStorage.setItem('gic-panel-pos', JSON.stringify({ left: panelEl.offsetLeft, top: panelEl.offsetTop })); } catch (e) {}
       };
       window.addEventListener('mousemove', onMove);
       window.addEventListener('mouseup', onUp);
@@ -1710,9 +1821,8 @@
 
   function runDiag() {
     const lines = [];
-    let ver = SCRIPT_VERSION;
-    try { ver = GM_info.script.version || SCRIPT_VERSION; } catch (e) {}
-    lines.push('脚本版本：' + ver + (ver === '?' ? '（无法读取，请检查是否用 Tampermonkey 安装）' : ''));
+    // SCRIPT_VERSION 已在加载时从 GM_info 同步（无沙箱环境回退字面量），无需重复读取
+    lines.push('脚本版本：' + SCRIPT_VERSION);
     lines.push('文件夹选择方式：' + (typeof window.showDirectoryPicker === 'function' ? '原生 API ✅' : '上传控件（兜底）'));
     lines.push('userActivation：' + (navigator.userActivation ? '支持' : '不支持（旧浏览器）'));
     const ed = getEditor();
