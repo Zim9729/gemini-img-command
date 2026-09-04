@@ -7,7 +7,7 @@
 const GM_setValue = (k, v) => { try { localStorage.setItem('gic-gm:' + k, String(v)); } catch (e) {} };
 const GM_getValue  = (k, d) => { try { const v = localStorage.getItem('gic-gm:' + k); return v === null ? d : v; } catch (e) { return d; } };
 const GM_registerMenuCommand = function () {};
-const GM_info = { script: { version: '2.1.2', name: 'Gemini 批量图片生成面板' } };
+const GM_info = { script: { version: '2.1.3', name: 'Gemini 批量图片生成面板' } };
 const GM_xmlhttpRequest = (opts) => {
   chrome.runtime.sendMessage(
     { type: 'gmxhr', opts: { method: opts.method || 'GET', url: opts.url } },
@@ -46,7 +46,7 @@ const GM_xmlhttpRequest = (opts) => {
   'use strict';
 
   /* ---- 版本标识与加载横幅（F12 控制台过滤 gic 即可确认脚本是否在运行） ---- */
-  const SCRIPT_VERSION = '2.1.2';
+  const SCRIPT_VERSION = '2.1.3';
   try {
     console.log('%c[gic] Gemini 批量图片生成面板 v' + SCRIPT_VERSION + ' 已加载',
       'color:#8ab4f8;font-weight:bold');
@@ -90,11 +90,15 @@ const GM_xmlhttpRequest = (opts) => {
   const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
   const now = () => new Date().toLocaleTimeString('zh-CN', { hour12: false });
 
+  // 取消标志：stopQueue 设为 true 后，所有 waitFor 轮询会立即返回 null，使长操作秒级中断
+  let cancelRequested = false;
+
   function waitFor(fn, timeout, step) {
     step = step || 500;
     return new Promise((resolve) => {
       const t0 = Date.now();
       const timer = setInterval(() => {
+        if (cancelRequested) { clearInterval(timer); resolve(null); return; }
         let v = null;
         try { v = fn(); } catch (e) { v = null; }
         if (v) { clearInterval(timer); resolve(v); }
@@ -645,7 +649,7 @@ const GM_xmlhttpRequest = (opts) => {
 
   async function startRun(files, prompt) {
     const old = metaLoad();
-    if (old && !old.done) {
+    if (old && !old.done && !old.stopped) {
       toast('已有队列在执行中（点「停止」可终止）');
       return;
     }
@@ -678,9 +682,10 @@ const GM_xmlhttpRequest = (opts) => {
   async function processQueue() {
     if (localRunning) return;
     const m = metaLoad();
-    if (!m || m.done) return;
+    if (!m || m.done || m.stopped) return;
     if (!tryAcquireLock()) { log('⏸ 其他标签页正在处理队列'); return; }
     localRunning = true;
+    cancelRequested = false;
     const hb = setInterval(heartbeat, 5000);
     try {
       panelShow();
@@ -690,7 +695,7 @@ const GM_xmlhttpRequest = (opts) => {
 
       for (let i = m.idx; i < m.names.length; i++) {
         const cur = metaLoad();
-        if (!cur || cur.done) { log('⏹ 队列已被停止'); return; }
+        if (!cur || cur.done || cur.stopped) { log('⏹ 队列已被停止'); return; }
         if (m.statuses[i] === 'ok' || m.statuses[i] === 'err') continue;
 
         panelSetState(m, i, 'busy');
@@ -707,6 +712,14 @@ const GM_xmlhttpRequest = (opts) => {
           panelSetState(m, i, 'ok');
           log('✅ ' + m.names[i]);
         } catch (e) {
+          // 被用户停止时，当前图片回退为 pending（不标记为错误），以便续跑
+          if (cancelRequested) {
+            m.statuses[i] = 'pending';
+            m.stopped = true; // stopQueue 已写 stopped=true，但 m 是循环开始时加载的快照，需补上再保存
+            metaSave(m);
+            log('⏹ 已停止，当前图片未完成（点「执行」可继续）');
+            return;
+          }
           m.statuses[i] = 'err';
           m.errors = m.errors || {};
           m.errors[i] = String((e && e.message) || e);
@@ -714,6 +727,9 @@ const GM_xmlhttpRequest = (opts) => {
           log('❌ ' + m.names[i] + '：' + m.errors[i]);
         }
         m.idx = i + 1;
+        // stopQueue 可能在 processOne 的不可中断段（如 downloadImages）期间写入 stopped=true，
+        // m 是循环开始时的快照不含该字段，保存前需同步，否则会覆盖 stopped 导致队列不停止
+        if (cancelRequested) m.stopped = true;
         metaSave(m);
         await fileDel(i);
         await sleep(1200);
@@ -728,6 +744,7 @@ const GM_xmlhttpRequest = (opts) => {
     } finally {
       clearInterval(hb);
       localRunning = false;
+      cancelRequested = false;
       releaseLock();
       updatePanelState();
     }
@@ -735,12 +752,14 @@ const GM_xmlhttpRequest = (opts) => {
 
   function stopQueue() {
     const q = metaLoad();
-    if (q && !q.done) {
-      q.done = true;
+    if (q && !q.done && !q.stopped) {
+      q.stopped = true;
       metaSave(q);
+      cancelRequested = true; // 让正在执行的 waitFor 秒级返回 null
       releaseLock();
       renderList(q);
-      toast('已停止队列（已完成的图片不受影响）');
+      updatePanelState();
+      toast('已停止（点「执行」可从停止处继续）');
     } else {
       toast('当前没有执行中的队列');
     }
@@ -1063,7 +1082,9 @@ const GM_xmlhttpRequest = (opts) => {
   async function updatePanelState() {
     if (!panelEl || !folderLabelEl || !runBtn || !stopBtn) return;
     const m = metaLoad();
-    const running = !!(m && !m.done);
+    const running = !!(m && !m.done && !m.stopped);
+    const stopped = !!(m && !m.done && m.stopped);
+    const hasPending = stopped && m.statuses.some((s) => s === 'pending');
     let label = pickedLabel || '';
     if (!label) {
       // 显示记住的文件夹（若有）
@@ -1073,6 +1094,7 @@ const GM_xmlhttpRequest = (opts) => {
       } catch (e) {}
     }
     folderLabelEl.textContent = label || '未选择（受浏览器安全限制，文件夹需通过选择框指定，指定一次后会被记住）';
+    runBtn.textContent = hasPending ? '▶ 继续' : '▶ 执行';
     runBtn.disabled = running;
     runBtn.style.opacity = running ? '.5' : '1';
     stopBtn.disabled = !running;
@@ -1098,7 +1120,20 @@ const GM_xmlhttpRequest = (opts) => {
   /* ---- 执行 ---- */
   async function executeClick() {
     const q = metaLoad();
-    if (q && !q.done) { toast('队列正在执行中'); return; }
+    if (q && !q.done && !q.stopped) { toast('队列正在执行中'); return; }
+
+    // 续跑：检测到已停止且仍有未完成图片时，从断点继续
+    if (q && !q.done && q.stopped) {
+      const hasPending = q.statuses.some((s) => s === 'pending');
+      if (hasPending) {
+        q.stopped = false;
+        metaSave(q);
+        log('▶ 继续执行队列（从第 ' + (q.idx + 1) + ' 张开始）');
+        updatePanelState();
+        processQueue();
+        return;
+      }
+    }
 
     // 本次会话已选过 → 直接用；否则尝试上次的文件夹句柄
     let files = pickedFiles;
@@ -1270,10 +1305,13 @@ const GM_xmlhttpRequest = (opts) => {
     await sleep(1200);
     try {
       const m = metaLoad();
-      if (m && !m.done) {
+      if (m && !m.done && !m.stopped) {
         log('↻ 检测到未完成的队列，自动续跑…');
         panelShow();
         processQueue();
+      } else if (m && !m.done && m.stopped) {
+        log('⏸ 检测到已停止的队列（点「继续」可从断点执行）');
+        panelShow();
       } else if (!sessionStorage.getItem('gic-hint')) {
         sessionStorage.setItem('gic-hint', '1');
         panelShow();
