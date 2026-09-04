@@ -7,7 +7,7 @@
 const GM_setValue = (k, v) => { try { localStorage.setItem('gic-gm:' + k, String(v)); } catch (e) {} };
 const GM_getValue  = (k, d) => { try { const v = localStorage.getItem('gic-gm:' + k); return v === null ? d : v; } catch (e) { return d; } };
 const GM_registerMenuCommand = function () {};
-const GM_info = { script: { version: '2.1.4', name: 'Gemini 批量图片生成面板' } };
+const GM_info = { script: { version: '2.1.5', name: 'Gemini 批量图片生成面板' } };
 const GM_xmlhttpRequest = (opts) => {
   chrome.runtime.sendMessage(
     { type: 'gmxhr', opts: { method: opts.method || 'GET', url: opts.url } },
@@ -46,7 +46,7 @@ const GM_xmlhttpRequest = (opts) => {
   'use strict';
 
   /* ---- 版本标识与加载横幅（F12 控制台过滤 gic 即可确认脚本是否在运行） ---- */
-  const SCRIPT_VERSION = '2.1.4';
+  const SCRIPT_VERSION = '2.1.5';
   try {
     console.log('%c[gic] Gemini 批量图片生成面板 v' + SCRIPT_VERSION + ' 已加载',
       'color:#8ab4f8;font-weight:bold');
@@ -492,15 +492,23 @@ const GM_xmlhttpRequest = (opts) => {
       ...document.querySelectorAll(PREVIEW_SEL),
       ...((cr ? [...cr.querySelectorAll('img')] : []))
     ]);
+    // 附件预览图尺寸下限：Gemini 的图标/按钮 img 通常 < 40px，附件预览缩略图 ≥ 50px
+    const PREVIEW_MIN_SIZE = 50;
+    const isPreviewImg = (img) => {
+      if (!isVisible(img) || panelEl?.contains(img)) return false;
+      const w = img.naturalWidth || img.width || 0;
+      const h = img.naturalHeight || img.height || 0;
+      return w >= PREVIEW_MIN_SIZE && h >= PREVIEW_MIN_SIZE;
+    };
     const attached = () => {
       const r = composerRoot();
       if (r && (r.textContent || '').includes(nameKey)) return true;                 // 出现文件名 chip
       if ([...document.querySelectorAll(PREVIEW_SEL)]                              // 或出现新的预览元素
         .some((el) => !before.has(el) && isVisible(el) && !inResponseArea(el) && !panelEl?.contains(el))) return true;
-      // 兜底：检测 composerRoot 内新增的 img 元素（Gemini 改版后预览图 src 格式可能变化）
+      // 兜底：检测 composerRoot 内新增的、尺寸足够大的 img 元素（排除小图标）
       if (r) {
         const imgs = [...r.querySelectorAll('img')];
-        if (imgs.some((img) => !before.has(img) && isVisible(img) && !panelEl?.contains(img))) return true;
+        if (imgs.some((img) => !before.has(img) && isPreviewImg(img))) return true;
       }
       return false;
     };
@@ -538,6 +546,19 @@ const GM_xmlhttpRequest = (opts) => {
     }
 
     throw new Error('无法把图片放入输入框（粘贴/拖放/file input 均未检测到附件预览，请点「诊断」反馈）');
+  }
+
+  // 发送前最终校验：确认附件确实存在（防止 attached 误判导致只发提示词）
+  function verifyAttachment(nameKey) {
+    const r = composerRoot();
+    if (!r) return false;
+    // 条件 1：文件名 chip 出现在输入区
+    if ((r.textContent || '').includes(nameKey)) return true;
+    // 条件 2：PREVIEW_SEL 元素存在于输入区附近
+    if ([...document.querySelectorAll(PREVIEW_SEL)].some((el) => isVisible(el) && !inResponseArea(el) && !panelEl?.contains(el))) return true;
+    // 条件 3：composerRoot 内有 ≥ 50px 的预览图
+    if ([...r.querySelectorAll('img')].some((img) => img.naturalWidth >= 50 && img.naturalHeight >= 50 && isVisible(img))) return true;
+    return false;
   }
 
   async function sendAndWait() {
@@ -709,6 +730,11 @@ const GM_xmlhttpRequest = (opts) => {
     if (!file) throw new Error('文件数据丢失，请重新发起任务');
     await clearEditor();
     await uploadFile(file);
+    // 发送前最终校验：确认附件确实存在，防止 attached 误判导致只发提示词
+    const nameKey = (file.name.replace(/\.[^.]+$/, '') || file.name).slice(0, 20);
+    if (!verifyAttachment(nameKey)) {
+      throw new Error('附件校验失败：图片未真正附加到输入框（请点「诊断」反馈）');
+    }
     await setPrompt(prompt);
     const imgs = await sendAndWait();
     await downloadImages(imgs, name);

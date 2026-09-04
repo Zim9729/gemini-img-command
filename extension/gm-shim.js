@@ -7,7 +7,7 @@
 const GM_setValue = (k, v) => { try { localStorage.setItem('gic-gm:' + k, String(v)); } catch (e) {} };
 const GM_getValue  = (k, d) => { try { const v = localStorage.getItem('gic-gm:' + k); return v === null ? d : v; } catch (e) { return d; } };
 const GM_registerMenuCommand = function () {};
-const GM_info = { script: { version: '2.1.4', name: 'Gemini 批量图片生成面板' } };
+const GM_info = { script: { version: '2.1.5', name: 'Gemini 批量图片生成面板' } };
 const GM_xmlhttpRequest = (opts) => {
   chrome.runtime.sendMessage(
     { type: 'gmxhr', opts: { method: opts.method || 'GET', url: opts.url } },
