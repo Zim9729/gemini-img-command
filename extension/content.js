@@ -7,7 +7,7 @@
 const GM_setValue = (k, v) => { try { localStorage.setItem('gic-gm:' + k, String(v)); } catch (e) {} };
 const GM_getValue  = (k, d) => { try { const v = localStorage.getItem('gic-gm:' + k); return v === null ? d : v; } catch (e) { return d; } };
 const GM_registerMenuCommand = function () {};
-const GM_info = { script: { version: '2.3.3', name: 'Gemini 批量图片生成面板' } };
+const GM_info = { script: { version: '2.5.3', name: 'Gemini 批量图片生成面板' } };
 const GM_xmlhttpRequest = (opts) => {
   // 超时契约与用户脚本 v2.3.2 对齐：background 无响应（fetch 挂起/worker 消失）时
   // 触发 ontimeout，防止队列永久卡死（用户脚本对 GM_xhr 传 timeout: 60000）
@@ -50,7 +50,7 @@ const GM_xmlhttpRequest = (opts) => {
  *         → 下载生成图，文件名与原图完全一致
  *    5. 「🗑 重置」随时清掉当前队列与已选文件（提示词、选项、记住的文件夹保留）
  *    6. 检测到用量限额（「额度重置/限额/quota…」纯文字回复）时自动等待额度恢复：
- *       回复含明确时间（如「3 小时后」「14:30 重置」）则按该时间等待，否则按面板间隔
+ *       优先读取「查看用量」页的当前用量重置时间；其次解析回复中的明确时间，最后按面板间隔
  *       （默认 30 分钟）轮询；到点自动重试当前张，额度恢复后队列继续，不记为失败
  *
  *  说明：受浏览器安全限制，无法直接输入本地路径文本，文件夹通过
@@ -64,7 +64,7 @@ const GM_xmlhttpRequest = (opts) => {
   /* ---- 版本标识与加载横幅（F12 控制台过滤 gic 即可确认脚本是否在运行） ---- */
   // 版本以 @version 为准：运行时读 GM_info（Tampermonkey 始终同步提供），字面量仅作无沙箱兜底，
   // 消除两处手工双写漂移的可能
-  let SCRIPT_VERSION = '2.3.3';
+  let SCRIPT_VERSION = '2.5.3';
   try {
     if (typeof GM_info !== 'undefined' && GM_info && GM_info.script && GM_info.script.version) {
       SCRIPT_VERSION = GM_info.script.version;
@@ -83,11 +83,13 @@ const GM_xmlhttpRequest = (opts) => {
     defaultPrompt: '',             // 面板中的提示词（自动保存）
     newChatPerImage: true,         // 每张图新开一个对话
     exactName: true,               // 严格使用原文件名（不做扩展名纠正）
+    matchSize: true,               // 生成图与原图尺寸不同时，保存前在内存中缩放为原图尺寸
     waitTimeoutMs: 300 * 1000,     // 单张图等待生成的超时（5 分钟）
     uploadTimeoutMs: 120 * 1000,   // 等待附件上传完成的超时（2 分钟）
     minImgSize: 200,               // 判定为「生成图」的最小宽度(px)
     uploadPath: 'paste',           // 上次成功的上传途径（paste/drop/input），下次优先尝试，避免在失效途径上反复白等超时
     quotaRetryMs: 30 * 60 * 1000,  // 检测到用量限额后，等待额度恢复的重试间隔（默认 30 分钟，面板「限额等待」可改）
+    quotaResetAt: 0,               // 从 Gemini「查看用量」页读取的当前用量重置绝对时刻
   };
 
   function safeParse(s) {
@@ -330,7 +332,11 @@ const GM_xmlhttpRequest = (opts) => {
     return !!(root && (root === el || root.contains(el)));
   }
 
-  function findSendButton() {
+  // requireEnabled=true：用于「点发送」，必须可用；false：用于完成判定，只看存在且可见——
+  // 发送后编辑器被清空，新版界面可能把发送键置灰（disabled）留在原位，若此时仍要求可用，
+  // 完成判定永远等不到「发送键恢复」，每张图都白等满单张超时（表现为图已生成但脚本不动）
+  function findSendBtn(requireEnabled) {
+    const enabledOk = (b) => !requireEnabled || !b.disabled;
     const roots = [];
     const cr = composerRoot();
     if (cr) roots.push(cr);
@@ -342,7 +348,7 @@ const GM_xmlhttpRequest = (opts) => {
     ];
     for (const root of roots) {
       for (const sel of sels) {
-        const list = [...root.querySelectorAll(sel)].filter((b) => !b.disabled && b.getClientRects().length);
+        const list = [...root.querySelectorAll(sel)].filter((b) => enabledOk(b) && b.getClientRects().length);
         if (list.length) return list[list.length - 1];
       }
       // 图标名兜底（Material 图标 send / arrow_upward）
@@ -351,12 +357,41 @@ const GM_xmlhttpRequest = (opts) => {
         const name = (ic.textContent || ic.getAttribute('fonticon') || '').trim().toLowerCase();
         if (name === 'send' || name === 'arrow_upward') {
           const b = ic.closest('button');
-          if (b && !b.disabled && b.getClientRects().length) return b;
+          if (b && enabledOk(b) && b.getClientRects().length) return b;
         }
       }
     }
+    // 结构兜底（Google 改版改掉发送键的 class/aria-label/图标名时——v2.4.0 诊断反馈：
+    // 发送按钮 ❌ 而其余关键元素全部 ✅）：发送键是输入区末尾（最右侧）的动作按钮。
+    // 排除停止键与麦克风/上传/添加附件类左侧工具按钮，避免误点听写或附件入口
+    if (cr) {
+      const btnIconNames = (b) => [...b.querySelectorAll('mat-icon, .material-symbols-outlined, [fonticon]')]
+        .map((ic) => (ic.textContent || ic.getAttribute('fonticon') || '').trim().toLowerCase());
+      const isStopish = (b) => {
+        const t = (b.getAttribute('aria-label') || '') + (b.getAttribute('mattooltip') || '');
+        if (/stop|停止/i.test(t)) return true;
+        return btnIconNames(b).some((n) => n === 'stop' || n === 'stop_circle');
+      };
+      const isSideBtn = (b) => {
+        const t = (b.getAttribute('aria-label') || '') + ' ' + (b.getAttribute('mattooltip') || '');
+        if (/mic|dictat|voice|语音|麦克风|听写|upload|上传|attach|附件|添加|相机|camera|文件|相册|相片|图片|photo|gallery|drive/i.test(t)) return true;
+        return btnIconNames(b).some((n) => /mic|photo_camera|attach_file|^add$|^upload|^image/.test(n));
+      };
+      const btns = [...cr.querySelectorAll('button, [role="button"]')]
+        .filter((b) => enabledOk(b) && b.getClientRects().length && isVisible(b))
+        .filter((b) => !isStopish(b) && !isSideBtn(b));
+      let best = null;
+      for (const b of btns) {
+        if (!best || b.getBoundingClientRect().right > best.getBoundingClientRect().right) best = b;
+      }
+      if (best) return best;
+    }
     return null;
   }
+
+  function findSendButton() { return findSendBtn(true); }
+  // 完成判定用：发送键「存在即可」（含置灰状态），见 findSendBtn 注释
+  function sendButtonVisible() { return findSendBtn(false); }
 
   function findStopButton() {
     const roots = [];
@@ -401,7 +436,10 @@ const GM_xmlhttpRequest = (opts) => {
     return null;
   }
 
-  const isFreshChat = () => !!getEditor() && (/^\/app\/?$/.test(location.pathname) || countResponses() === 0);
+  // 回复容器选择器全部失效（Google 改版）时 countResponses() 恒为 0：
+  // 页面上若仍有用户消息节点，说明并非新对话，不能据此误判而跳过新对话切换
+  const isFreshChat = () => !!getEditor() && (/^\/app\/?$/.test(location.pathname)
+    || (countResponses() === 0 && !document.querySelector('user-query, .query-content')));
 
   // 不做整页刷新：按钮 → SPA 路由软跳转 → 都失败则返回 false，由调用方决定是否在当前对话继续
   async function tryStartNewChat() {
@@ -424,6 +462,19 @@ const GM_xmlhttpRequest = (opts) => {
 
   function countResponses() { return document.querySelectorAll(RESP_SELS).length; }
 
+  // 用户消息（user-query）里的图片地址集合：回复中「回显的原图」与用户消息同址，据此排除，
+  // 否则多图回复里回显的原图会被当成生成图存成 _2 副本。主路径与无容器兜底共用
+  function collectUserQuerySrcs() {
+    const set = new Set();
+    [...document.querySelectorAll('user-query, .query-content, [data-test-id*="query"]')].forEach((q) => {
+      [...q.querySelectorAll('img')].forEach((im) => {
+        const s = im.currentSrc || im.src || '';
+        if (s) set.add(s);
+      });
+    });
+    return set;
+  }
+
   function isGeneratedImg(im) {
     if (!im.complete || !im.naturalWidth) return false;
     if (im.closest('user-query, .query-content, [data-test-id*="query"]')) return false; // 排除用户消息里的原图
@@ -433,18 +484,11 @@ const GM_xmlhttpRequest = (opts) => {
 
   // 收集生成图。skipCount/skipEls 限定只扫描「发送后新增」的回复：
   // 在当前对话续跑（新对话按钮找不到时的回退路径，或关闭了每图新对话）且本条回复
-  // 是纯文字/被拒绝时，若扫描全部回复会把上一条历史回复的图当成结果，按当前文件名存错图
-  function collectResponseImages(skipCount, skipEls) {
+  // 是纯文字/被拒绝时，若扫描全部回复会把上一条历史回复的图当成结果，按当前文件名存错图。
+  // prevSrcs：sendAndWait 在点击发送前拍的全页图片 src 快照，供容器选择器失效时的兜底收集用
+  function collectResponseImages(skipCount, skipEls, prevSrcs) {
     skipCount = skipCount || 0;
-    // 用户消息里的图片地址：回复中「回显的原图」与用户消息同址，据此排除，
-    // 否则多图回复里回显的原图会被当成生成图存成 _2 副本
-    const userSrcs = new Set();
-    [...document.querySelectorAll('user-query, .query-content, [data-test-id*="query"]')].forEach((q) => {
-      [...q.querySelectorAll('img')].forEach((im) => {
-        const s = im.currentSrc || im.src || '';
-        if (s) userSrcs.add(s);
-      });
-    });
+    const userSrcs = collectUserQuerySrcs();
     const list = [...document.querySelectorAll(RESP_SELS)];
     // 长对话虚拟滚动会移除旧回复节点，使 list.length < skipCount（位置水位失真）→
     // 退化为纯身份比对（只扫不在快照集合里的回复）；水位仍有效时两种判断并用
@@ -459,7 +503,27 @@ const GM_xmlhttpRequest = (opts) => {
       if (userSrcs.size) imgs = imgs.filter((im) => !userSrcs.has(im.currentSrc || im.src || ''));
       if (imgs.length) return imgs;
     }
-    return [];
+    // 兜底（Google 改版把回复容器改名时主路径一无所获，表现为 Gemini 明明出了图、
+    // 脚本却逐张报「回复中没有生成图片」——用户诊断反馈：页面上 12 张生成大图均为
+    // blob: 地址而主路径抓不到）：不依赖容器，按两个与结构无关的事实收集——
+    //   ① 生成图位于「最后一条用户消息」之后（DOM 顺序，对话 UI 的固有结构）
+    //   ② 生成图的 src 是发送前不存在的（历史回复的图都在发送前快照里；用户消息里
+    //      回显的原图与发送前输入框预览同 blob 地址，一并被快照排除）
+    // 容器正常时永远走不到这里，主路径的 skipCount/skipEls 精确性不受影响
+    if (!prevSrcs || !prevSrcs.size) return [];
+    let imgs = [...document.querySelectorAll('img')].filter(isGeneratedImg)
+      .filter((im) => !userSrcs.has(im.currentSrc || im.src || ''))
+      .filter((im) => !prevSrcs.has(im.currentSrc || im.src || ''));
+    const qs = [...document.querySelectorAll('user-query, .query-content, [data-test-id*="query"]')];
+    const lastQuery = qs.length ? qs[qs.length - 1] : null;
+    if (lastQuery) {
+      imgs = imgs.filter((im) => {
+        if (lastQuery.contains(im)) return false; // 用户消息内部的回显原图
+        try { return !!(lastQuery.compareDocumentPosition(im) & Node.DOCUMENT_POSITION_FOLLOWING); }
+        catch (e) { return true; }
+      });
+    }
+    return imgs;
   }
 
   // 用量限额检测：Gemini 免费额度用尽时回复纯文字（如「一旦您的额度重置，我就可以创建更多图片。
@@ -533,6 +597,132 @@ const GM_xmlhttpRequest = (opts) => {
     return null;
   }
 
+  // Gemini 聊天页的「用量限额将在…重置」偶尔会与「查看用量」页不一致；后者的
+  // 「当前用量 → 重置时间」才是权威值。只在当前用量卡中取值，不能误把「每周限额」
+  // 的重置时间当成图片生成额度的重置时间。
+  function parseUsageResetAt(text, nowMs) {
+    const s = String(text || '').replace(/\u00a0/g, ' ');
+    const current = /(?:当前用量|current usage)/i.exec(s);
+    if (!current) return null;
+
+    let section = s.slice(current.index, current.index + 1200);
+    const nextLimit = section.search(/(?:每周限额|weekly limit|每月限额|monthly limit)/i);
+    if (nextLimit >= 0) section = section.slice(0, nextLimit);
+
+    const label = /(?:重置时间|reset time)\s*[：:]?\s*/i.exec(section);
+    if (!label) return null;
+    const tail = section.slice(label.index + label[0].length, label.index + label[0].length + 80);
+    // 支持「20:17」「9月5日 20:17」「9/5 8:17 PM」「下午 8:17」。
+    const m = tail.match(/(?:(?:(\d{4})\s*(?:年|[.\/-]))?\s*(\d{1,2})\s*(?:月|[.\/-])\s*(\d{1,2})\s*(?:日)?\s*)?((?:上午|下午|早上|晚上|凌晨)\s*)?(\d{1,2})\s*[:：]\s*(\d{2})(?:\s*(上午|下午|am|pm))?/i);
+    if (!m) return null;
+
+    let hour = parseInt(m[5], 10);
+    const minute = parseInt(m[6], 10);
+    if (!(hour >= 0 && hour < 24 && minute >= 0 && minute < 60)) return null;
+    const meridiem = ((m[4] || '') + ' ' + (m[7] || '')).trim().toLowerCase();
+    if ((meridiem === 'pm' || /下午|晚上/.test(meridiem)) && hour < 12) hour += 12;
+    if ((meridiem === 'am' || /上午|早上|凌晨/.test(meridiem)) && hour === 12) hour = 0;
+
+    const now = new Date(Number.isFinite(nowMs) ? nowMs : Date.now());
+    let year = now.getFullYear();
+    let month = now.getMonth();
+    let day = now.getDate();
+    const hasDate = !!(m[2] && m[3]);
+    if (hasDate) {
+      year = m[1] ? parseInt(m[1], 10) : year;
+      month = parseInt(m[2], 10) - 1;
+      day = parseInt(m[3], 10);
+      if (!(month >= 0 && month < 12 && day >= 1 && day <= 31)) return null;
+    }
+
+    const target = new Date(year, month, day, hour, minute, 0, 0);
+    if (!Number.isFinite(target.getTime())) return null;
+    // 时间未带日期时，Gemini 展示的是下一次发生的该时刻；已经过了就属于明天。
+    if (!hasDate && target.getTime() <= now.getTime()) target.setDate(target.getDate() + 1);
+    // 带月日但不带年份时，取下一次出现的该月日，覆盖跨年时的用量页展示。
+    if (hasDate && !m[1] && target.getTime() < now.getTime()) target.setFullYear(target.getFullYear() + 1);
+    return target.getTime();
+  }
+
+  function usageResetWaitMs() {
+    const resetAt = Number(cfg.quotaResetAt);
+    const remaining = resetAt - Date.now();
+    // 当前用量的下一次重置不应超过一天；过期/异常缓存不参与等待。
+    if (!Number.isFinite(resetAt) || remaining <= 0 || remaining > 25 * 60 * 60 * 1000) return null;
+    // 给 Gemini 后端刷新一点余量，避免显示刚到重置时刻但请求仍被限额。
+    return Math.round(remaining + 15000);
+  }
+
+  function syncUsageResetTime() {
+    const body = document.body;
+    if (!body) return null;
+    const text = body.innerText || body.textContent || '';
+    const nowMs = Date.now();
+    const previousAt = Number(cfg.quotaResetAt);
+    const resetAt = parseUsageResetAt(text, nowMs);
+    if (!resetAt) return null;
+    // 同一时刻的旧页面文本不会因计时器/日志触发 DOM 变化就变成明天。
+    // 用上一轮重置前的时刻再解析一次，确认页面仍在展示同一轮额度。
+    if (previousAt > 0 && previousAt <= nowMs && nowMs - previousAt < 24 * 60 * 60 * 1000
+      && parseUsageResetAt(text, previousAt - 1) === previousAt) return previousAt;
+    if (Number(cfg.quotaResetAt) !== resetAt) {
+      cfg.quotaResetAt = resetAt;
+      saveCfg();
+      log('⏰ 已从「查看用量」同步额度重置时间：'
+        + new Date(resetAt).toLocaleTimeString('zh-CN', { hour12: false, hour: '2-digit', minute: '2-digit' }));
+    }
+    return resetAt;
+  }
+
+  let usageResetSyncTimer = null;
+  let lastUsageResetSyncAt = 0;
+  function watchUsageResetTime() {
+    const sync = () => {
+      usageResetSyncTimer = null;
+      lastUsageResetSyncAt = Date.now();
+      syncUsageResetTime();
+    };
+    sync();
+    const observer = new MutationObserver(() => {
+      if (usageResetSyncTimer) return;
+      const delay = Math.max(0, 2000 - (Date.now() - lastUsageResetSyncAt));
+      usageResetSyncTimer = setTimeout(sync, delay);
+    });
+    observer.observe(document.body, { childList: true, subtree: true, characterData: true });
+    window.addEventListener('pagehide', () => observer.disconnect(), { once: true });
+  }
+
+  let quotaRetryAt = 0;
+  async function waitForQuotaRetry(qid, fallbackWaitMs) {
+    quotaRetryAt = Date.now() + fallbackWaitMs;
+    let selectedResetAt = 0;
+    try {
+      while (!cancelRequested) {
+        const cur = metaLoad();
+        if (!cur || cur.id !== qid || cur.stopped || cur.done) return false;
+        const resetAt = Number(cfg.quotaResetAt);
+        // 只在获得新的有效时刻时修改截止时间；到点后缓存过期也不能退回兜底间隔。
+        if (resetAt !== selectedResetAt && usageResetWaitMs() !== null) {
+          selectedResetAt = resetAt;
+          quotaRetryAt = resetAt + 15000;
+          log('⏳ 下次自动重试：' + new Date(quotaRetryAt).toLocaleString('zh-CN', { hour12: false }) + '（查看用量页）');
+        }
+        const remaining = quotaRetryAt - Date.now();
+        if (remaining <= 0) {
+          log('⏰ 限额等待已到期，自动重试当前图片并继续剩余队列');
+          return true;
+        }
+        await waitFor(() => {
+          const current = metaLoad();
+          return !current || current.id !== qid || current.stopped || current.done;
+        }, Math.min(remaining, 5000), 500);
+      }
+      return false;
+    } finally {
+      quotaRetryAt = 0;
+    }
+  }
+
   const fmtDur = (ms) => {
     const min = Math.round(ms / 60000);
     if (min >= 60) return Math.floor(min / 60) + ' 小时 ' + (min % 60) + ' 分钟';
@@ -553,16 +743,29 @@ const GM_xmlhttpRequest = (opts) => {
     sel.addRange(range);
   }
 
-  // 移除输入区里残留的附件（上一张失败后留下的图片 chip），避免下一张叠加成两张
+  // 移除输入区里残留的附件（上一张失败后留下的图片 chip），避免下一张叠加成两张、
+  // 发送时一次带出多张图（用户诊断：输入区同时挂着 4 个附件）。
+  // Google 改版把移除键的 aria-label 从「移除/删除」改成了「关闭附件」（图标 close），
+  // 选择器需覆盖新旧两种叫法，再兜底「输入区内图标为 close 的可见按钮」
   async function clearAttachments() {
     const root = composerRoot();
     if (!root) return;
     const sels = [
       'button[aria-label*="移除"]', 'button[aria-label*="删除"]', 'button[aria-label*="Remove"]', 'button[aria-label*="Delete"]',
+      'button[aria-label*="关闭附件"]', 'button[aria-label*="移除附件"]', 'button[aria-label*="删除附件"]',
+      'button[aria-label*="Close attachment"]', 'button[aria-label*="Remove file"]', 'button[aria-label*="Remove attachment"]',
       'button[mattooltip*="移除"]', 'button[mattooltip*="Remove"]'
     ];
-    for (let n = 0; n < 5; n++) {
-      const b = sels.map((s) => [...root.querySelectorAll(s)].filter(isVisible)[0]).find(Boolean);
+    for (let n = 0; n < 10; n++) {
+      let b = sels.map((s) => [...root.querySelectorAll(s)].filter(isVisible)[0]).find(Boolean);
+      // 兜底：输入区内图标名为 close 的可见按钮即附件移除键（label 再怎么改都不怕）
+      if (!b) {
+        b = [...root.querySelectorAll('button mat-icon, button .material-symbols-outlined, button [fonticon]')]
+          .filter(isVisible)
+          .filter((ic) => ((ic.textContent || ic.getAttribute('fonticon') || '').trim().toLowerCase() === 'close'))
+          .map((ic) => ic.closest('button'))
+          .find((btn) => btn && btn.getClientRects().length) || null;
+      }
       if (!b) break;
       b.click();
       await sleep(300);
@@ -821,6 +1024,11 @@ const GM_xmlhttpRequest = (opts) => {
     // 上一张超时后服务端仍在生成、其迟到回复若在等待窗口内到达，就会漏进快照被误认成本次结果
     const prevEls = new Set(document.querySelectorAll(RESP_SELS));
     const prevCount = prevEls.size;
+    // 发送前全页图片 src 快照：回复容器选择器失效（改版）时，无容器兜底收集据此排除
+    // 历史回复的图与用户消息里的回显原图（回显图与发送前输入框预览同 blob 地址）
+    const prevSrcs = new Set([...document.querySelectorAll('img')]
+      .map((im) => im.currentSrc || im.src || '')
+      .filter(Boolean));
     btn.click();
     log('  ✉ 已发送，等待生成…');
 
@@ -841,7 +1049,7 @@ const GM_xmlhttpRequest = (opts) => {
     // 仅靠 countResponses() > prevCount 会漏判已开始生成
     const started = await waitFor(() =>
       [...document.querySelectorAll(RESP_SELS)].some((el) => !prevEls.has(el))
-      || !!findStopButton() || !findSendButton()
+      || !!findStopButton() || !sendButtonVisible()
     , 60000, 700);
     if (queueGone()) throw stopErr();
     if (!started) throw new Error('发送后未检测到新回复');
@@ -859,11 +1067,26 @@ const GM_xmlhttpRequest = (opts) => {
       const imgSrcs = list.slice(-3)
         .flatMap((c) => [...c.querySelectorAll('img')].map((im) => im.currentSrc || im.src || ''))
         .join('|');
-      return list.length + '|' + (last ? (last.textContent || '').length : 0) + '|' + imgSrcs;
+      // 容器选择器失效（改版）时 list 恒为空、签名恒定，「稳定 4 秒」会在发送按钮一恢复
+      // 就触发完成判定，而图可能尚未渲染。此时改用全页大图 src 集合参与签名：
+      // 生成图渲染进来会使签名变化，稳定计时从图片出现后重新起算
+      const allImgSrcs = list.length ? '' : [...document.querySelectorAll('img')]
+        .filter((im) => (im.naturalWidth || 0) >= cfg.minImgSize)
+        .map((im) => im.currentSrc || im.src || '').join('|');
+      return list.length + '|' + (last ? (last.textContent || '').length : 0) + '|' + imgSrcs + '|' + allImgSrcs;
     };
+    // 等待期间每 60 秒输出一次心跳日志：长等待不再像卡死，远程排查「卡住」时可直接
+    // 看最后日志停在哪个阶段、等待了多久
+    const t0Done = Date.now();
+    let lastBeat = 0;
     const done = await waitFor(() => {
       if (queueGone()) return STOP_MARK;
-      if (!findSendButton() || findStopButton()) { sig = ''; sigAt = 0; return false; }
+      const nowMs = Date.now();
+      if (nowMs - lastBeat >= 60000) {
+        lastBeat = nowMs;
+        log('  ⏳ 仍在等待生成…（已等 ' + Math.round((nowMs - t0Done) / 1000) + ' 秒）');
+      }
+      if (!sendButtonVisible() || findStopButton()) { sig = ''; sigAt = 0; return false; }
       const s = pageSig();
       if (s !== sig) { sig = s; sigAt = Date.now(); return false; }
       if (!sigAt) { sigAt = Date.now(); return false; }
@@ -873,14 +1096,15 @@ const GM_xmlhttpRequest = (opts) => {
     if (!done) throw new Error('等待生成超时');
 
     await sleep(2500); // 图片渲染稳定
-    let imgs = collectResponseImages(prevCount, prevEls);
+    let imgs = collectResponseImages(prevCount, prevEls, prevSrcs);
     if (!imgs.length) {
       // 等图的同时监测限额文字（纯文字回复会很快出现，命中即提前结束等待，不用耗满窗口）
+      log('  ⏳ 生成图未就绪，继续等待渲染（≤30 秒）…');
       const got = await waitFor(() => {
         if (queueGone()) return STOP_MARK;
         const qt = quotaDetected(prevCount, prevEls);
         if (qt) return { quotaText: qt };
-        const v = collectResponseImages(prevCount, prevEls);
+        const v = collectResponseImages(prevCount, prevEls, prevSrcs);
         return v.length ? v : null;
       }, 30000, 1500);
       if (got === STOP_MARK) throw stopErr();
@@ -975,6 +1199,40 @@ const GM_xmlhttpRequest = (opts) => {
     try { return await drawToBlob(bm, bm.width, bm.height, ext); } finally { bm.close(); }
   }
 
+  // 读取 blob/File 的像素尺寸（createImageBitmap 失败返回 null，调用方自行降级）
+  async function imageSizeOfBlob(blob) {
+    let bm = null;
+    try {
+      bm = await createImageBitmap(blob);
+      const s = { w: bm.width, h: bm.height };
+      bm.close();
+      return s;
+    } catch (e) {
+      try { if (bm) bm.close(); } catch (_) {}
+      return null;
+    }
+  }
+
+  // 把图片数据缩放绘制到 w×h 并按 ext 编码（源/目标比例不同即为拉伸）。
+  // 采用「先在内存中缩放、再保存」而非「保存后再改」：浏览器脚本无法改写已下载到
+  // 下载目录的文件，内存中一次成型保证只落盘一个尺寸正确的文件
+  async function resizeBlobTo(blob, w, h, ext) {
+    const bm = await createImageBitmap(blob);
+    try {
+      return await new Promise((resolve, reject) => {
+        try {
+          const c = document.createElement('canvas');
+          c.width = w; c.height = h;
+          const ctx = c.getContext('2d');
+          ctx.imageSmoothingEnabled = true;
+          ctx.imageSmoothingQuality = 'high';
+          ctx.drawImage(bm, 0, 0, w, h);
+          c.toBlob((b) => (b ? resolve(b) : reject(new Error('canvas 导出为空'))), MIME_BY_EXT[ext] || 'image/png', 0.95);
+        } catch (e) { reject(new Error('canvas 缩放失败（' + ((e && e.name) || e) + '）')); }
+      });
+    } finally { bm.close(); }
+  }
+
   function saveBlob(blob, filename) {
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
@@ -986,7 +1244,7 @@ const GM_xmlhttpRequest = (opts) => {
     setTimeout(() => URL.revokeObjectURL(url), 60000);
   }
 
-  async function downloadImages(imgs, origName) {
+  async function downloadImages(imgs, origName, origSize) {
     const p = splitName(origName);
     for (let i = 0; i < imgs.length; i++) {
       const suffix = imgs.length > 1 ? (i === 0 ? '' : '_' + (i + 1)) : '';
@@ -1010,6 +1268,21 @@ const GM_xmlhttpRequest = (opts) => {
           catch (e) { log('  ⚠ 格式转换失败，按原始 ' + realExt.toUpperCase() + ' 数据保存为 .' + p.ext); }
         } else {
           useExt = realExt;
+        }
+      }
+      // 尺寸对齐原图：Gemini 输出的分辨率常与原图不同，保存前在内存中缩放到与原图一致。
+      // GIF 不缩放（canvas 转码会丢动画）；目标格式 canvas 无法编码（如 .bmp）时跳过；
+      // 缩放失败按生成图原始尺寸保存，不中断队列
+      if (cfg.matchSize && origSize && realExt !== 'gif' && MIME_BY_EXT[useExt]) {
+        const sz = await imageSizeOfBlob(blob);
+        if (sz && (sz.w !== origSize.w || sz.h !== origSize.h)) {
+          if (Math.abs(sz.w / sz.h - origSize.w / origSize.h) > 0.02) {
+            log('  ⚠ 生成图 ' + sz.w + '×' + sz.h + ' 与原图 ' + origSize.w + '×' + origSize.h + ' 比例不同，将拉伸对齐');
+          }
+          try {
+            blob = await resizeBlobTo(blob, origSize.w, origSize.h, useExt);
+            log('  📐 已缩放至原图尺寸 ' + origSize.w + '×' + origSize.h);
+          } catch (e) { log('  ⚠ 尺寸对齐失败，按生成图原始尺寸保存：' + ((e && e.message) || e)); }
         }
       }
       const filename = p.base + suffix + '.' + useExt;
@@ -1070,7 +1343,13 @@ const GM_xmlhttpRequest = (opts) => {
     }
     await setPrompt(prompt);
     const imgs = await sendAndWait(qid);
-    await downloadImages(imgs, name);
+    // 原图尺寸只在需要时解码一次（尺寸对齐关闭时零开销）
+    let origSize = null;
+    if (cfg.matchSize) {
+      origSize = await imageSizeOfBlob(file);
+      if (!origSize) log('  ⚠ 无法读取原图尺寸，跳过尺寸对齐');
+    }
+    await downloadImages(imgs, name, origSize);
   }
 
   async function processQueue() {
@@ -1142,10 +1421,14 @@ const GM_xmlhttpRequest = (opts) => {
               log('⏹ 队列已停止，不再等待额度恢复（点「执行」可从该张继续）');
               return;
             }
-            // 等待时长：优先用回复中解析出的明确时间（「3 小时后」「14:30」等）；
-            // 回复不含时间（如「一旦您的额度重置…」）则退回面板设定的间隔
-            let waitMs = parseQuotaWaitMs(e && e.quotaText);
-            let waitSrc = waitMs ? '回复中解析' : null;
+            // 「查看用量」页的当前用量重置时间优先级最高：聊天页的限额提示有时
+            // 不带时间，或显示出与用量页不同的时刻。没有缓存时才解析回复/使用兜底间隔。
+            let waitMs = usageResetWaitMs();
+            let waitSrc = waitMs ? '查看用量页' : null;
+            if (!waitMs) {
+              waitMs = parseQuotaWaitMs(e && e.quotaText);
+              waitSrc = waitMs ? '回复中解析' : null;
+            }
             if (!waitMs) {
               waitMs = cfg.quotaRetryMs;
               if (typeof waitMs !== 'number' || !(waitMs >= 60000)) waitMs = 30 * 60 * 1000;
@@ -1157,14 +1440,9 @@ const GM_xmlhttpRequest = (opts) => {
               + '（预计 ' + new Date(Date.now() + waitMs).toLocaleTimeString('zh-CN', { hour12: false })
               + '，点「停止」可中断）');
             toast('用量限额：' + fmtDur(waitMs) + '后自动重试', 6000);
-            // 等待期间心跳/锁保持；本标签页「停止/重置」会置 cancelRequested 使本等待提前结束；
-            // 其他标签页的「停止」（meta 里 stopped=true，id 不变）或「重置/替换」（meta 换 id）也在此
-            // 提前结束（原实现只看 id，跨标签页停止要白等满整个 waitMs，最长 24 小时），
-            // 下一轮循环顶部的检查会立即退出
-            await waitFor(() => {
-              const cur = metaLoad();
-              return !!(cur && (cur.id !== qid || cur.stopped));
-            }, waitMs, 5000);
+            // 分段等待：用户在等待期间打开「查看用量」页后，观察器会缓存真实时刻，
+            // 下一次 5 秒轮询立即改按该时刻等待，无须把原先的固定间隔等完。
+            if (!(await waitForQuotaRetry(qid, waitMs))) return;
             i--; // 抵消 for 的 i++，重试当前张
             continue;
           }
@@ -1542,11 +1820,14 @@ const GM_xmlhttpRequest = (opts) => {
     row3.style.cssText = 'display:flex;gap:14px;margin-bottom:10px;color:#bdc1c6;font-size:11.5px;flex-wrap:wrap';
     const cb1 = makeCheckbox('每张图新开对话', cfg.newChatPerImage, (v) => { cfg.newChatPerImage = v; saveCfg(); });
     const cb2 = makeCheckbox('严格原文件名', cfg.exactName, (v) => { cfg.exactName = v; saveCfg(); });
+    const cb3 = makeCheckbox('尺寸对齐原图', cfg.matchSize, (v) => { cfg.matchSize = v; saveCfg(); });
+    cb3.title = '生成图与原图尺寸不同时，保存前自动缩放为原图尺寸（比例不同会拉伸；GIF 不处理）';
     row3.appendChild(cb1);
     row3.appendChild(cb2);
+    row3.appendChild(cb3);
     // 限额重试间隔（分钟）：检测到用量限额后每隔多久自动重试
     const quotaWrap = document.createElement('label');
-    quotaWrap.title = '检测到用量限额后，等待额度恢复的重试间隔';
+    quotaWrap.title = '检测到用量限额后，优先使用「查看用量」页同步的真实重置时间；未获取时按此间隔重试';
     quotaWrap.style.cssText = 'display:flex;align-items:center;gap:4px;cursor:pointer';
     const quotaInput = document.createElement('input');
     quotaInput.type = 'number';
@@ -1843,28 +2124,128 @@ const GM_xmlhttpRequest = (opts) => {
     const lines = [];
     // SCRIPT_VERSION 已在加载时从 GM_info 同步（无沙箱环境回退字面量），无需重复读取
     lines.push('脚本版本：' + SCRIPT_VERSION);
-    lines.push('文件夹选择方式：' + (typeof window.showDirectoryPicker === 'function' ? '原生 API ✅' : '上传控件（兜底）'));
-    lines.push('userActivation：' + (navigator.userActivation ? '支持' : '不支持（旧浏览器）'));
+    const resetAt = Number(cfg.quotaResetAt);
+    const resetWait = usageResetWaitMs();
+    lines.push('查看用量重置时间缓存：' + (resetWait
+      ? '✅ ' + new Date(resetAt).toLocaleString('zh-CN', { hour12: false })
+      : '未获取或已过期'));
+    lines.push('限额等待截止时间：' + (quotaRetryAt
+      ? new Date(quotaRetryAt).toLocaleString('zh-CN', { hour12: false }) : '当前未在限额等待'));
+    const queueState = metaLoad();
+    lines.push('队列状态：' + (!queueState || queueState.done ? '已完成或无队列'
+      : queueState.stopped ? '已停止' : localRunning ? '本标签页执行中' : '等待执行或由其他标签页执行'));
     const ed = getEditor();
     const allEds = document.querySelectorAll(EDITOR_SELS.join(','));
+    const sb = findSendButton();
+    const ncb = tryFindNewChatButton();
+    const respN = countResponses();
+    // 关键元素一行汇总放最前：反馈内容即使被截断，首行也带着结论
+    lines.push('关键元素汇总：输入框' + (ed ? '✅' : '❌')
+      + ' | 发送按钮' + (sb ? '✅' : '❌')
+      + ' | 新对话按钮' + (ncb ? '✅' : '❌')
+      + ' | 回复容器' + (respN ? '✅(' + respN + ')' : '❌(0)'));
+    lines.push('文件夹选择方式：' + (typeof window.showDirectoryPicker === 'function' ? '原生 API ✅' : '上传控件（兜底）'));
+    lines.push('userActivation：' + (navigator.userActivation ? '支持' : '不支持（旧浏览器）'));
     lines.push('输入框：' + (ed ? '✅ ' + describeEl(ed) : '❌ 未找到') + '（候选 ' + allEds.length + ' 个，可见 ' + [...allEds].filter(isVisible).length + ' 个）');
     const cr = composerRoot();
     lines.push('输入区容器：' + (cr ? '✅ ' + describeEl(cr) : '❌ 未找到'));
-    const sb = findSendButton();
-    lines.push('发送按钮：' + (sb ? '✅ ' + (sb.getAttribute('aria-label') || describeEl(sb)) : '❌ 未找到'));
-    const ncb = tryFindNewChatButton();
+    const rawSend = document.querySelectorAll('button.send-button').length;
+    lines.push('发送按钮：' + (sb ? '✅ ' + (sb.getAttribute('aria-label') || describeEl(sb)) : '❌ 未找到（button.send-button 原始匹配 ' + rawSend + ' 个；>0 = 按钮在但被禁用/隐藏，如输入框为空时属正常）'));
+    // 输入区按钮清单：发送键改版时，这里的 label/icon/位置直接给出新标记
+    if (cr) {
+      const cbs = [...cr.querySelectorAll('button, [role="button"]')];
+      lines.push('输入区按钮：' + cbs.length + ' 个');
+      cbs.slice(0, 12).forEach((b, idx) => {
+        const r = b.getBoundingClientRect();
+        const icon = [...b.querySelectorAll('mat-icon, .material-symbols-outlined, [fonticon]')]
+          .map((ic) => (ic.textContent || ic.getAttribute('fonticon') || '').trim()).filter(Boolean).join('/');
+        const label = ((b.getAttribute('aria-label') || '') + ' ' + (b.getAttribute('mattooltip') || '')).trim();
+        lines.push('  - #' + idx + (b.disabled ? ' [禁用]' : '') + (r.width ? '' : ' [隐藏]')
+          + ' label="' + (label || '(无)') + '" icon="' + (icon || '(无)') + '" x=' + Math.round(r.left) + ' w=' + Math.round(r.width));
+      });
+    }
     lines.push('新对话按钮：' + (ncb ? '✅ ' + (ncb.getAttribute('aria-label') || (ncb.textContent || '').trim().slice(0, 20)) : '❌ 未找到'));
     const inputs = [...document.querySelectorAll('input[type="file"]')];
     lines.push('文件输入框：' + inputs.length + ' 个');
     lines.push('附件预览元素（blob 图/预览组件）：' + [...document.querySelectorAll(PREVIEW_SEL)].filter((el) => isVisible(el) && !inResponseArea(el)).length + ' 个');
     inputs.slice(0, 3).forEach((i) => lines.push('  - accept=' + (i.accept || '(空)')));
-    lines.push('回复容器数量：' + countResponses());
+    lines.push('回复容器数量：' + respN);
+    // 容器候选计数：主选择器归零（改版）时，哪个候选仍有计数，新容器的名字就是哪个
+    const respCandidates = ['model-response', 'response-container', 'message-content', 'chat-window', 'conversation-container', '.model-response-text', '.response-container-content'];
+    lines.push('回复容器候选计数：' + respCandidates.map((s) => s + '=' + document.querySelectorAll(s).length).join('，'));
+    // 大图按所在区域归类：「未识别区域」占比高即说明回复容器结构变了（改版）
     const bigImgs = [...document.querySelectorAll('img')].filter((i) => (i.naturalWidth || 0) >= cfg.minImgSize);
-    lines.push('页面大图（≥' + cfg.minImgSize + 'px）：' + bigImgs.length + ' 张');
-    bigImgs.slice(-3).forEach((i) => lines.push('  - ' + i.naturalWidth + '×' + i.naturalHeight + ' ' + String(i.currentSrc || i.src || '').slice(0, 70)));
-    const msg = lines.join('\n');
+    const imgCtx = (im) => inComposer(im) ? '输入框'
+      : im.closest('user-query, .query-content, [data-test-id*="query"]') ? '用户消息'
+      : im.closest(RESP_SELS) ? '回复区' : '未识别区域⚠';
+    const ctxCount = {};
+    bigImgs.forEach((im) => { const c = imgCtx(im); ctxCount[c] = (ctxCount[c] || 0) + 1; });
+    lines.push('页面大图（≥' + cfg.minImgSize + 'px）：' + bigImgs.length + ' 张'
+      + (bigImgs.length ? '（' + Object.keys(ctxCount).map((k) => k + ' ' + ctxCount[k]).join(' / ') + '）' : ''));
+    bigImgs.slice(-5).forEach((i) => {
+      const src = String(i.currentSrc || i.src || '');
+      lines.push('  - [' + imgCtx(i) + '|' + (src.split(':')[0] || '?') + '] ' + i.naturalWidth + '×' + i.naturalHeight + ' ' + src.slice(0, 70));
+    });
+    const msg = lines.join('\n')
+      + '\n\n提示：若关键元素为 ❌，说明 Google 改了页面结构。\n请点「📋 一键复制」把全文发给维护者（文字可直接据此改代码，比截图有用），以便更新选择器。';
     log('诊断完成');
-    alert(msg + '\n\n提示：若关键元素为 ❌，说明 Google 改了页面结构。\n请把以上内容截图反馈，以便更新选择器。');
+    showDiagDialog(msg);
+  }
+
+  /* ---- 诊断结果弹窗（一键复制）：alert 无法选中复制，改为 textarea + 复制按钮 ---- */
+  function showDiagDialog(msg) {
+    const mask = document.createElement('div');
+    mask.style.cssText = 'position:fixed;inset:0;z-index:2147483647;background:rgba(0,0,0,.55);display:flex;align-items:center;justify-content:center;padding:20px;box-sizing:border-box';
+    const box = document.createElement('div');
+    box.style.cssText = 'background:#1e1f22;color:#e3e3e3;border:1px solid #3c4043;border-radius:12px;padding:16px 18px;width:520px;max-width:94vw;max-height:86vh;display:flex;flex-direction:column;box-shadow:0 6px 24px rgba(0,0,0,.45);font:13px/1.6 system-ui,sans-serif;box-sizing:border-box';
+    const head = document.createElement('div');
+    head.style.cssText = 'font-weight:600;margin-bottom:8px';
+    head.textContent = '🔍 诊断结果（v' + SCRIPT_VERSION + '）';
+    const ta = document.createElement('textarea');
+    ta.value = msg;
+    ta.readOnly = true;
+    ta.spellcheck = false;
+    ta.style.cssText = 'flex:1;min-height:220px;width:100%;box-sizing:border-box;background:#141517;color:#bdc1c6;border:1px solid #3c4043;border-radius:8px;padding:8px 10px;font:11px/1.6 Consolas,Menlo,monospace;resize:vertical';
+    const row = document.createElement('div');
+    row.style.cssText = 'display:flex;gap:10px;margin-top:10px;align-items:center';
+    const copyBtn = document.createElement('button');
+    copyBtn.textContent = '📋 一键复制';
+    copyBtn.style.cssText = 'background:#8ab4f8;color:#202124;border:0;border-radius:8px;padding:8px 18px;font-size:13px;font-weight:600;cursor:pointer';
+    const closeBtn = document.createElement('button');
+    closeBtn.textContent = '关闭';
+    closeBtn.style.cssText = 'background:#2a2b2f;color:#9aa0a6;border:1px solid #3c4043;border-radius:8px;padding:8px 14px;font-size:12px;cursor:pointer';
+    const tip = document.createElement('span');
+    tip.style.cssText = 'color:#9aa0a6;font-size:11px;margin-left:auto';
+    tip.textContent = '复制后粘贴发给维护者';
+    row.appendChild(copyBtn); row.appendChild(closeBtn); row.appendChild(tip);
+    box.appendChild(head); box.appendChild(ta); box.appendChild(row);
+    mask.appendChild(box);
+    (document.body || document.documentElement).appendChild(mask);
+
+    const close = () => { try { mask.remove(); } catch (e) {} };
+    closeBtn.addEventListener('click', close);
+    mask.addEventListener('click', (e) => { if (e.target === mask) close(); });
+    copyBtn.addEventListener('click', async () => {
+      const ok = await copyText(msg, ta);
+      copyBtn.textContent = ok ? '✅ 已复制' : '⚠ 复制失败，请在框内手动全选复制';
+      copyBtn.style.background = ok ? '#81c995' : '#f28b82';
+      setTimeout(() => { copyBtn.textContent = '📋 一键复制'; copyBtn.style.background = '#8ab4f8'; }, 2500);
+    });
+  }
+
+  // 复制文本：剪贴板 API 优先（https + 用户手势内可用）；失败回退 execCommand
+  // （readonly textarea 仍可 select + copy，作为非安全上下文/权限受限时的兜底）
+  async function copyText(text, ta) {
+    try {
+      await navigator.clipboard.writeText(text);
+      return true;
+    } catch (e) { /* 走回退 */ }
+    try {
+      ta.focus();
+      ta.select();
+      ta.setSelectionRange(0, text.length);
+      return document.execCommand('copy');
+    } catch (e) { return false; }
   }
 
   /* ============================================================
@@ -1898,6 +2279,9 @@ const GM_xmlhttpRequest = (opts) => {
     try {
       ensureLauncher();
       ensurePanel();
+      // 用户点 Gemini 的「查看用量」后，同页脚本会读取“当前用量”的真实重置时刻并缓存；
+      // 回到对话页遇到限额时即可直接按该时刻等待。
+      watchUsageResetTime();
       console.log('[gic] 悬浮按钮与面板已创建（右下角 🖼）');
     } catch (e) {
       console.error('[gic] 界面创建失败：', e);
